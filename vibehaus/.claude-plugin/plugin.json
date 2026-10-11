@@ -1,0 +1,23 @@
+{
+  "name": "vibehaus",
+  "displayName": "Vibehaus",
+  "version": "0.1.0",
+  "description": "A cozy pixel house for your Claude Code agents: the lead, subagents and background tasks from every session as a Clawd household in an autumn garden, with a live tasks list, hover cards and plan usage bars.",
+  "author": {
+    "name": "rmguney",
+    "url": "https://github.com/rmguney"
+  },
+  "homepage": "https://github.com/rmguney/vibehaus",
+  "repository": "https://github.com/rmguney/vibehaus",
+  "license": "MIT",
+  "privacyPolicyUrl": "https://github.com/rmguney/vibehaus#privacy-and-permissions",
+  "supportUrl": "https://github.com/rmguney/vibehaus/issues",
+  "documentationUrl": "https://github.com/rmguney/vibehaus#readme",
+  "termsOfServiceUrl": "https://github.com/rmguney/vibehaus/blob/main/LICENSE",
+  "keywords": [
+    "pixel-art", "isometric", "animation", "cozy", "agents", "subagents",
+    "background-tasks", "multi-session", "usage", "dashboard", "visualization", "mod"
+  ],
+  "icon": "./icon.png",
+  "types": "./types/index.d.ts"
+}

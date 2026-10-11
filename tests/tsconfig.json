@@ -1,0 +1,4 @@
+{
+  "extends": "../vibehaus/.claude-plugin/types/tsconfig.json",
+  "include": [".", "../vibehaus/hooks", "../vibehaus/types"]
+}

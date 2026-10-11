@@ -1,0 +1,19 @@
+{
+  "name": "vibehaus",
+  "owner": {
+    "name": "rmguney",
+    "url": "https://github.com/rmguney"
+  },
+  "description": "Vibehaus: A cozy pixel house for your Claude Code agents",
+  "plugins": [
+    {
+      "name": "vibehaus",
+      "source": "./vibehaus",
+      "category": "visualization",
+      "tags": [
+        "pixel-art", "isometric", "animation", "cozy", "agents", "subagents",
+        "background-tasks", "multi-session", "usage", "dashboard", "visualization", "mod"
+      ]
+    }
+  ]
+}
