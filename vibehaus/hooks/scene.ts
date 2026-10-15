@@ -9,19 +9,19 @@
  * over a busy agent's shoulder, and huddle up to talk in runes.
  *
  * Plans and walks are worked out on the floor plan and projected into the
- * picture: the house as one SVG, its agents in pictures laid over it,
- * animated with SMIL timelines anchored to the clock, so a redraw picks every
- * agent up mid-stride.
+ * picture: the garden as one SVG, the house as another over it, its agents in
+ * more laid over that, animated with SMIL timelines anchored to the clock, so
+ * a redraw picks every agent up mid-stride.
  */
 import type { Resident, Place, Room, Track } from '../types'
-import { fitText, pixelText, textWidth } from './font'
+import { fitText, glyphText, pixelText, textWidth } from './font'
 import { desk, deskAt, furniture, machine } from './furniture'
-import { frontTrees, gardenPatterns, ground, lamps, treesBehind, weather } from './garden'
+import { frontTrees, garden, gardenPatterns, lamps, treesBehind, weather } from './garden'
 import { boxSpots, road, signAt, yardOf, yardPieces } from './yard'
 import type { Parcel } from './yard'
-import { ALL_ROOMS, at, doorX, doorY, floor, floorBottom, freeFloor, frontDoor, frontWalls, house, patterns, ROOM_STYLE, shell, T, TALL_WALL, windowOn } from './house'
+import { ALL_ROOMS, at, doorX, doorY, floor, floorBottom, freeFloor, frontDoor, frontWalls, house, patterns, ROOM_STYLE, shell, stretch, T, TALL_WALL, windowOn } from './house'
 import type { Cell, Dir, Layout } from './house'
-import { Canvas, dayStyle, loopBegin, nightStyle, pathOf, setClock, shade } from './iso'
+import { Canvas, loopBegin, pathOf, rng, setClock, shade, styleOf } from './iso'
 import type { Pt } from './iso'
 
 // Every idle routine is one loop of this many seconds, shared so that
@@ -87,18 +87,6 @@ function hash(text: string): number {
   return n
 }
 
-// mulberry32: a small seeded generator, so a plan is the same on every redraw.
-function rng(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0
-    let t = a
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
 const between = (r: () => number, a: number, b: number) => a + r() * (b - a)
 const pick = <T>(list: readonly T[], r: () => number): T => list[Math.floor(r() * list.length) % list.length] as T
 const r1 = (n: number) => Math.round(n * 10) / 10
@@ -121,31 +109,41 @@ function blinkAnim(attr: string, on: string, off: string, periodMs: number): str
 
 // A 0/1 opacity track that is on inside the spans of a timeline of `total`
 // seconds; discrete, looping or held at its end.
-function track(spans: Span[], total: number, begin: number, isLoop: boolean): { attr: string; anim: string } {
+// When `spans` of a timeline `total` seconds long are on (1) and off (0), as
+// steps from the start.
+type Step = { t: number; v: number }
+function stepsOf(spans: Span[], total: number): Step[] {
   const merged = spans
     .map(([a, b]) => [Math.max(0, a), Math.min(total, b)] as Span)
     .filter(([a, b]) => b > a)
     .sort((p, q) => p[0] - q[0])
-  if (merged.length === 0) return { attr: ' opacity="0"', anim: '' }
-  const at0 = (merged[0] as Span)[0] <= 0
-  const points: { t: number; v: number }[] = [{ t: 0, v: at0 ? 1 : 0 }]
+  if (merged.length === 0) return [{ t: 0, v: 0 }]
+  const points: Step[] = [{ t: 0, v: (merged[0] as Span)[0] <= 0 ? 1 : 0 }]
   for (const [a, b] of merged) {
     if (a > 0) points.push({ t: a, v: 1 })
     if (b < total) points.push({ t: b, v: 0 })
   }
-  const clean: { t: number; v: number }[] = []
+  const clean: Step[] = []
   for (const p of points) {
     const last = clean[clean.length - 1]
     if (last && p.t / total - last.t / total < 0.0002) { last.v = p.v; continue }
     if (last && last.v === p.v) continue
     clean.push({ ...p })
   }
-  if (clean.length === 1) return { attr: ` opacity="${clean[0]?.v ?? 0}"`, anim: '' }
+  return clean
+}
+
+// A discrete animation stepping through `values` at the steps' times.
+function stepAnim(attr: string, values: string[], steps: Step[], total: number, begin: number, isLoop: boolean): string {
   const repeat = isLoop ? 'repeatCount="indefinite"' : 'fill="freeze"'
-  return {
-    attr: ` opacity="${clean[0]?.v ?? 0}"`,
-    anim: `<animate attributeName="opacity" values="${clean.map(p => p.v).join(';')}" keyTimes="${clean.map(p => k4(p.t / total)).join(';')}" calcMode="discrete" dur="${r2(Math.max(0.1, total))}s" begin="-${r2(begin)}s" ${repeat}/>`,
-  }
+  return `${attr} values="${values.join(';')}" keyTimes="${steps.map(p => k4(p.t / total)).join(';')}" calcMode="discrete" dur="${r2(Math.max(0.1, total))}s" begin="-${r2(begin)}s" ${repeat}/>`
+}
+
+function track(spans: Span[], total: number, begin: number, isLoop: boolean): { attr: string; anim: string } {
+  const steps = stepsOf(spans, total)
+  const attr = ` opacity="${steps[0]?.v ?? 0}"`
+  if (steps.length === 1) return { attr, anim: '' }
+  return { attr, anim: stepAnim('<animate attributeName="opacity"', steps.map(p => String(p.v)), steps, total, begin, isLoop) }
 }
 
 function group(content: string, t: { attr: string; anim: string }): string {
@@ -177,16 +175,16 @@ export function colorFor(c: Resident): string {
 const teamOf = (session: string): string | undefined => hues.get(session)
 
 // With more than one session in the house, each paints its agents' names and
-// rings, its boxes' tape and its section of the tasks list in a colour of its
-// own; with one, every name keeps the colour of its kind.
+// rings and its boxes' tape in a colour of its own; with one, every name keeps
+// the colour of its kind.
 const SESSION_COLORS = ['#ffd166', '#5ad0ff', '#f56fcf', '#7df08a', '#7b8cff', '#c9a0ff', '#5affd0', '#e4e6f0']
 let hues = new Map<string, string>()
 
 // `sessions` in the order every house lists them (oldest first), this one's
 // as ''; `self` names this one, so every house picks the same colours.
-export function paintSessions(sessions: string[], self: string): Map<string, string> {
+export function paintSessions(sessions: string[], self: string): void {
   hues = new Map()
-  if (sessions.length < 2) return hues
+  if (sessions.length < 2) return
   const taken = new Set<number>()
   for (const id of sessions) {
     let k = hash('session:' + (id || self)) % SESSION_COLORS.length
@@ -194,7 +192,6 @@ export function paintSessions(sessions: string[], self: string): Map<string, str
     taken.add(k)
     hues.set(id, SESSION_COLORS[k] ?? '#ffd166')
   }
-  return hues
 }
 
 // The kind of background task a resident is. Members saved before the
@@ -232,15 +229,11 @@ const ROLE_HINTS: [RegExp, string][] = [
 ]
 const WORK_ROLES: Record<string, string> = { shell: 'Cook', monitor: 'Neighbor', workflow: 'Butler' }
 
-function roleOf(c: Resident): string {
+export function displayName(c: Resident): string {
   if (c.kind === 'main') return 'Host'
   const type = taskTypeOf(c)
   if (type !== 'subagent') return WORK_ROLES[type] ?? 'Gremlin'
   return BUILT_IN_ROLES[c.kind] ?? ROLE_HINTS.find(([hint]) => hint.test(c.kind))?.[1] ?? 'Handyman'
-}
-
-export function displayName(c: Resident): string {
-  return roleOf(c)
 }
 
 export function bodyColor(c: Resident): string {
@@ -300,14 +293,21 @@ function textBubble(text: string, color = '#1a1a1a'): string {
   const t = fitText(text, 52, PX)
   const w = r1(textWidth(t, PX) + 4)
   return `<g transform="translate(${r1(-w / 2)} -25)"><rect x="0" y="0" width="${w}" height="6" fill="${fill}"/><rect x="${r1(w / 2 - 1)}" y="6" width="2" height="2" fill="${fill}"/>` +
-    `${pixelText(t, 2, 1.2, { color })}</g>`
+    `${agentText(t, 2, 1.2, { color })}</g>`
 }
 
 // ---------- layout and routes ----------
 
 // The house is the same shape in any pane; the picture scales to its width.
-const HOUSE_LAYOUT = house()
-const layout = (): Layout => HOUSE_LAYOUT
+// It stands in the middle of a tall garden going on 440 units above it and
+// below it: a pane shows as much of that as fits round the house, and a
+// picture for a file or a phone the house's own stretch of it. Every picture
+// is drawn in this one layout.
+export const LAYOUT = stretch(house(), 440)
+
+// The way a step faces: along whichever axis it goes further.
+const heading = (dx: number, dy: number): Dir => (Math.abs(dx) >= Math.abs(dy) ? (dx > 0 ? 'E' : 'W') : (dy > 0 ? 'S' : 'N'))
+const BACK = { E: 'W', W: 'E', N: 'S', S: 'N' } as const
 
 function cellAt(L: Layout, col: number, row: number): Cell {
   return L.rooms[L.grid[row]?.[col] ?? 'lounge']
@@ -406,7 +406,7 @@ type Prop = { id: string; room: Place; spot: Pt; face: Dir; dwell: Span; pose: P
 // TV and the bookshelves to lose an hour to, the fire, the fridge and the
 // coffee machine, a telescope, a radio and a workbench to fiddle with, and
 // out front, the mailbox to check.
-function furnish(L: Layout): { props: Prop[] } {
+function furnish(L: Layout): Prop[] {
   const props: Prop[] = []
   const r = L.rooms
   const add = (room: Room, id: string, x: number, y: number, face: Dir, pose: Pose, drive: Drive, dwell: Span, lines: string[], absorbed = false) =>
@@ -425,8 +425,9 @@ function furnish(L: Layout): { props: Prop[] } {
   add('workshop', 'bench', 12, 16, 'W', 'stand', 'stim', [8, 14], LINES_TINKER)
   const m = yardOf(L).mailbox
   props.push({ id: 'mailbox', room: 'yard', spot: { x: m.x + 3.5, y: m.y + 1 }, face: 'W', dwell: [4, 8], pose: 'stand', drive: 'stim', lines: LINES_MAIL })
-  return { props }
+  return props
 }
+const PROPS = furnish(LAYOUT)
 
 // ---------- temperament and moods ----------
 
@@ -526,45 +527,32 @@ class Plan {
 
   // `backwards`: facing away from where it goes, a moonwalk
   walkTo(room: Place, to: Pt, backwards = false): void {
-    const pts = route(this.L, this.room, this.at, room, to, this.lane)
+    this.walkAlong(room, route(this.L, this.room, this.at, room, to, this.lane), this.at, to, backwards, true)
+  }
+
+  // Along `pts` from `last`; `stops`: now and then a short stop on the way,
+  // right where it got to, then on without stopping again.
+  private walkAlong(room: Place, pts: Pt[], last: Pt, to: Pt, backwards: boolean, stops: boolean): void {
     const start = this.t
-    let last = this.at
+    const end = pts[pts.length - 1]
     for (const p of pts.slice(1)) {
       const dx = p.x - last.x
       const dy = p.y - last.y
       const d = Math.hypot(dx, dy)
       if (d < 0.5) continue
-      const dir: Dir = Math.abs(dx) >= Math.abs(dy) ? (dx > 0 ? 'E' : 'W') : (dy > 0 ? 'S' : 'N')
-      this.face(backwards ? ({ E: 'W', W: 'E', N: 'S', S: 'N' } as const)[dir] : dir)
+      const dir = heading(dx, dy)
+      this.face(backwards ? BACK[dir] : dir)
       this.t += d / this.speed
-      this.keys.push({ t: this.t, p, room: p === pts[pts.length - 1] ? room : roomAt(this.L, p, this.room) })
+      this.keys.push({ t: this.t, p, room: p === end ? room : roomAt(this.L, p, this.room) })
       last = p
-      // now and then, a short stop on the way, right where it got to
-      if (p !== pts[pts.length - 1] && this.r() < 0.06) {
+      if (stops && p !== end && this.r() < 0.06) {
         this.walk.push([start, this.t])
         this.room = roomAt(this.L, p, this.room)
         this.at = p
         this.hold(between(this.r, 0.3, 0.8))
-        return this.continueWalk(room, pts.slice(pts.indexOf(p)), to)
+        const rest = pts.slice(pts.indexOf(p))
+        return this.walkAlong(room, rest, p, to, false, false)
       }
-    }
-    this.walk.push([start, this.t])
-    this.room = room
-    this.at = to
-  }
-
-  private continueWalk(room: Place, rest: Pt[], to: Pt): void {
-    const start = this.t
-    let last = rest[0] as Pt
-    for (const p of rest.slice(1)) {
-      const dx = p.x - last.x
-      const dy = p.y - last.y
-      const d = Math.hypot(dx, dy)
-      if (d < 0.5) continue
-      this.face(Math.abs(dx) >= Math.abs(dy) ? (dx > 0 ? 'E' : 'W') : (dy > 0 ? 'S' : 'N'))
-      this.t += d / this.speed
-      this.keys.push({ t: this.t, p, room: p === rest[rest.length - 1] ? room : roomAt(this.L, p, this.room) })
-      last = p
     }
     this.walk.push([start, this.t])
     this.room = room
@@ -748,10 +736,10 @@ function goof(plan: Plan, L: Layout, kind: Antic, r: () => number, chatty: numbe
 // An agent's idle plan depends on itself, the house, its huddle partners and
 // the agents idle before it (their bookings), so it changes only with those.
 function planIdle(
-  L: Layout, props: Prop[], c: Resident, home: { room: Place; at: Pt }, idleSince: number, appts: Appointment[], ctx: IdleContext,
+  L: Layout, props: Prop[], c: Resident, home: { room: Place; at: Pt }, appts: Appointment[], ctx: IdleContext,
 ): Plan {
   const p = temperament(c.id)
-  const ph = moodOf(c.id, idleSince)
+  const ph = moodOf(c.id, c.idleSince ?? 0)
   const r = rng(hash(`${c.id}:${ph.index}`))
   const plan = new Plan(home.room, home.at, speedOf(c), L, r, laneOf(c.id))
   const talkChance = 0.35 / Math.sqrt(Math.max(1, ctx.crowd))
@@ -765,8 +753,9 @@ function planIdle(
   const queue = [...appts].sort((a, b) => a.t0 - b.t0)
   const endBy = LOOP - 0.5 - (onBusy ? plan.travel(home.room, home.at) : 0)
 
-  const fits = (room: Place, spot: Pt, dwell: number, deadline: number, back: { room: Place; spot: Pt }) => {
-    const go = plan.travel(room, spot)
+  // whether the trip out (`go` seconds, when already measured), a stay and
+  // the way on to `back` all end by the deadline
+  const fits = (room: Place, spot: Pt, dwell: number, deadline: number, back: { room: Place; spot: Pt }, go = plan.travel(room, spot)) => {
     const saved = { room: plan.room, at: plan.at }
     plan.room = room
     plan.at = spot
@@ -796,7 +785,7 @@ function planIdle(
       const spot = onFloor(L, w.room, { x: w.spot.x + (r() < 0.5 ? -7 : 7), y: w.spot.y + 11 })
       const dwell = between(r, 3, 6)
       const go = plan.travel(w.room, spot)
-      if (fits(w.room, spot, dwell, deadline, back) && book(ctx.bookings, `watch:${w.room}:${w.spot.x}`, [plan.t + go, plan.t + go + dwell], ctx.offset)) {
+      if (fits(w.room, spot, dwell, deadline, back, go) && book(ctx.bookings, `watch:${w.room}:${w.spot.x}`, [plan.t + go, plan.t + go + dwell], ctx.offset)) {
         plan.walkTo(w.room, spot)
         plan.face('N')
         if (r() < talkChance) plan.say(pick(LINES_LOOK, r))
@@ -810,7 +799,7 @@ function planIdle(
         const o = pick(options, r)
         const dwell = between(r, o.dwell[0], o.dwell[1])
         const go = plan.travel(o.room, o.spot)
-        if (fits(o.room, o.spot, dwell, deadline, back) && book(ctx.bookings, o.id, [plan.t + go - 0.5, plan.t + go + dwell + 0.5], ctx.offset)) {
+        if (fits(o.room, o.spot, dwell, deadline, back, go) && book(ctx.bookings, o.id, [plan.t + go - 0.5, plan.t + go + dwell + 0.5], ctx.offset)) {
           plan.walkTo(o.room, o.spot)
           plan.face(o.face)
           const t0 = plan.t
@@ -894,8 +883,9 @@ function planIdle(
     // it is too far to reach in time
     if (!next) break
     queue.shift()
-    if (plan.t + plan.travel(next.room, next.spot) > next.t0 + 1) continue
-    plan.hold(Math.max(0, next.t0 - plan.t - plan.travel(next.room, next.spot)))
+    const go = plan.travel(next.room, next.spot)
+    if (plan.t + go > next.t0 + 1) continue
+    plan.hold(Math.max(0, next.t0 - plan.t - go))
     plan.walkTo(next.room, next.spot)
     plan.hold(Math.max(0, next.t0 - plan.t))
     plan.face(next.face)
@@ -1067,6 +1057,57 @@ function part(id: string, draw: () => string): string {
   return `<use href="#${id}"/>`
 }
 
+// A glyph of the pixel font, drawn once for all the agents' words.
+const glyph = (id: string, d: string) => {
+  if (!bodyDefs.has(id)) bodyDefs.set(id, `<path id="${id}" d="${d}"/>`)
+}
+
+// Pixel text in an agent's picture, its glyphs shared.
+const agentText = (text: string, x: number, y: number, opts: Parameters<typeof pixelText>[3]) => glyphText(text, x, y, opts, glyph)
+
+// One pose of an agent: its legs as they stand (`s`), step (`w`) or tuck
+// away (`n`), under its body turned `wide` across x or along y.
+function poseOf(color: string, wide: 'x' | 'y', legs: 's' | 'w' | 'n', typing: boolean): string {
+  const id = `ps${wide}${legs}${typing ? 't' : ''}${color.slice(1)}`
+  if (!bodyDefs.has(id)) bodyDefs.set(id, `<g id="${id}">${legs === 'n' ? '' : clawdLegs(color, wide, legs === 'w')}${clawdBody(color, wide, typing)}</g>`)
+  return id
+}
+
+// Every pose an agent takes, side by side in a strip `POSE_GAP` apart, seen
+// through a window the size of one: the strip slides to the pose of the
+// moment, so one animation does what one per pose did.
+const POSE_GAP = 48
+const POSE_WINDOW = '<clipPath id="vh-pose"><rect x="-20" y="-30" width="40" height="38"/></clipPath>'
+
+function poseStrip(color: string, typing: boolean, across: Span[], along: Span[], walk: Span[], still: Span[], d: AgentDraw): string {
+  const total = d.total
+  const inside = (spans: Span[], t: number) => spans.some(([a, b]) => t >= a && t < b)
+  const edges = [...new Set([0, ...[across, along, walk, still].flatMap(list => list.flat())])].filter(t => t >= 0 && t < total).sort((a, b) => a - b)
+  const poses: string[] = []
+  const steps: Step[] = []
+  edges.forEach((t0, i) => {
+    const mid = (t0 + (edges[i + 1] ?? total)) / 2
+    const wide = inside(across, mid) ? 'x' : inside(along, mid) ? 'y' : undefined
+    const legs = inside(walk, mid) ? 'w' : inside(still, mid) ? 's' : 'n'
+    let v = -1
+    if (wide) {
+      const id = poseOf(color, wide, legs, wide === 'x' && typing)
+      v = poses.indexOf(id)
+      if (v < 0) v = poses.push(id) - 1
+    }
+    if (steps[steps.length - 1]?.v !== v) steps.push({ t: t0, v })
+  })
+  const only = poses[0]
+  if (only !== undefined && poses.length === 1 && steps.every(p => p.v === 0)) return `<use href="#${only}"/>`
+  if (!bodyDefs.has('vh-pose')) bodyDefs.set('vh-pose', POSE_WINDOW)
+  const strip = poses.map((id, i) => `<use href="#${id}"${i ? ` x="${i * POSE_GAP}"` : ''}/>`).join('')
+  const values = steps.map(p => (p.v < 0 ? '-9999 0' : `${-p.v * POSE_GAP} 0`))
+  const slide = steps.length > 1
+    ? `<g>${stepAnim('<animateTransform attributeName="transform" type="translate"', values, steps, total, d.begin, d.isLoop)}`
+    : `<g transform="translate(${values[0] ?? '0 0'})">`
+  return `<g clip-path="url(#vh-pose)">${slide}${strip}</g></g>`
+}
+
 // The body, `wide` across x (facing S or N) or along y (facing E or W), its
 // arms at the two ends; typing, the arms take turns going up.
 function clawdBody(color: string, wide: 'x' | 'y', typing: boolean): string {
@@ -1163,7 +1204,7 @@ const HATS: Record<string, [string, number[][]][]> = {
 }
 
 function hatOf(c: Resident): string {
-  const role = HATS[roleOf(c)] ? roleOf(c) : 'Handyman'
+  const role = displayName(c)
   return part(`hat-${role}`, () => {
     const hat = (HATS[role] ?? []).map(([color, boxes]) => pix(color, boxes)).join('')
     if (role !== 'Tinkerer') return hat
@@ -1202,13 +1243,6 @@ function clawdLegs(color: string, wide: 'x' | 'y', walking: boolean): string {
   })
 }
 
-// Where two timelines' spans overlap.
-function both(a: Span[], b: Span[]): Span[] {
-  const out: Span[] = []
-  for (const [p, q] of a) for (const [r, t] of b) if (Math.max(p, r) < Math.min(q, t)) out.push([Math.max(p, r), Math.min(q, t)])
-  return out
-}
-
 function agentSvg(c: Resident, d: AgentDraw): string {
   const tk = (spans: Span[]) => track(spans, d.total, d.begin, d.isLoop)
   const body = bodyColor(c)
@@ -1219,7 +1253,6 @@ function agentSvg(c: Resident, d: AgentDraw): string {
   const along = [...faces.E, ...faces.W]
   const team = teamOf(c.session ?? '')
   const hat = hatOf(c)
-  const bodies = group(clawdBody(body, 'x', !!d.typing), tk(across)) + group(clawdBody(body, 'y', false), tk(along))
   // the ring stays on the floor: not lifted with a hop, and not shown while
   // sitting or lying down
   const ring = team ? group(teamRing(team), tk(invert([...d.sit, ...d.sleep], d.total))) : ''
@@ -1237,23 +1270,20 @@ function agentSvg(c: Resident, d: AgentDraw): string {
   }).join('')
   const [ca, cb] = EYES.S
   const closed = group(rect({ x: r1(ca.x - 0.5), y: r1(ca.y + 1), w: 2, h: 1, c: '#1a1a1a' }) + rect({ x: r1(cb.x - 0.5), y: r1(cb.y + 1), w: 2, h: 1, c: '#1a1a1a' }), tk(sleeping))
-  // legs: a step every 180ms while walking, still otherwise, tucked when
-  // sitting; turned with the body
+  // legs and body, turned which way it faces: legs stepping every 180ms
+  // while walking, still otherwise, tucked when sitting or lying down
   const stillLegs = invert([...d.walk, ...d.sit, ...d.sleep], d.total)
-  const legs = (['x', 'y'] as const).map(wide => {
-    const facing = wide === 'x' ? across : along
-    return group(clawdLegs(body, wide, false), tk(both(stillLegs, facing))) + group(clawdLegs(body, wide, true), tk(both(d.walk, facing)))
-  }).join('')
+  const frame = poseStrip(body, !!d.typing, across, along, d.walk, stillLegs, d)
   // sitting drops the body 2px; sleeping lays it in the bed
   const lowered = [...d.sit, ...d.sleep]
   const drop = lowered.length > 0 ? discreteShift(lowered, d.total, d.begin, d.isLoop, '0 2') : ''
   // breathing
   const breath = r1(3.2 + (aph % 1.5))
   const bob = `<animateTransform attributeName="transform" type="translate" values="0 0;0 -0.6;0 0" dur="${breath}s" ${loopBegin(breath, aph)} repeatCount="indefinite" additive="sum"/>`
-  const zz = group(`<g>${pixelText('z', 5, -15, { color: '#cfd8ff' })}<animateTransform attributeName="transform" type="translate" values="0 0;0 -6" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/><animate attributeName="opacity" values="1;0" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/></g>`, tk(sleeping))
+  const zz = group(`<g>${agentText('z', 5, -15, { color: '#cfd8ff' })}<animateTransform attributeName="transform" type="translate" values="0 0;0 -6" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/><animate attributeName="opacity" values="1;0" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/></g>`, tk(sleeping))
   // the name under the feet, clear of the ring
   const nameY = (team ? 4.4 : 2) + (d.nameDy ?? 0)
-  const name = pixelText(fitText(`${c.isBackground ? '⧗ ' : ''}${displayName(c)}`, 26, NAME_PX), 0, nameY, { px: NAME_PX, color: colorFor(c), anchor: 'middle', cls: 'vh-ink' })
+  const name = agentText(fitText(`${c.isBackground ? '⧗ ' : ''}${displayName(c)}`, 26, NAME_PX), 0, nameY, { px: NAME_PX, color: colorFor(c), anchor: 'middle', cls: 'vh-ink' })
   const gauge = c.context !== undefined ? contextGauge(c.context, nameY + 4) : ''
   // hopping: up a beat, down a beat, for as long as a hop lasts
   const ups = (d.hop ?? []).flatMap(([a, b]) => {
@@ -1283,7 +1313,7 @@ function agentSvg(c: Resident, d: AgentDraw): string {
     : ''
 
   return `<g transform="translate(${r1(d.at.x)} ${r1(d.at.y)})" opacity="${c.status === 'done' ? 0.62 : 1}">${d.motion}${ring}` +
-    `<g>${drop}<g>${hop}<g>${bob}${legs}${bodies}${eyes}${closed}${capped}${load}${zz}${wave}${juggle}</g></g></g>${spark}${d.bubbles}${name}${gauge}</g>`
+    `<g>${drop}<g>${hop}<g>${bob}${frame}${eyes}${closed}${capped}${load}${zz}${wave}${juggle}</g></g></g>${spark}${d.bubbles}${name}${gauge}</g>`
 }
 
 // How full the lead's context window is: eight cells under its name, green,
@@ -1313,17 +1343,17 @@ function subtract(span: Span, cut: Span[]): Span[] {
 }
 
 function discreteShift(spans: Span[], total: number, begin: number, isLoop: boolean, by: string): string {
-  const t = track(spans, total, begin, isLoop)
-  if (!t.anim) return t.attr === ' opacity="1"' ? `<animateTransform attributeName="transform" type="translate" values="${by}" dur="1s" fill="freeze"/>` : ''
-  const values = /values="([^"]*)"/.exec(t.anim)?.[1]?.split(';').map(v => (v === '1' ? by : '0 0')).join(';') ?? ''
-  const times = /keyTimes="([^"]*)"/.exec(t.anim)?.[1] ?? ''
-  const repeat = isLoop ? 'repeatCount="indefinite"' : 'fill="freeze"'
-  return `<animateTransform attributeName="transform" type="translate" values="${values}" keyTimes="${times}" calcMode="discrete" dur="${r2(Math.max(0.1, total))}s" begin="-${r2(begin)}s" ${repeat}/>`
+  const steps = stepsOf(spans, total)
+  if (steps.length === 1) return steps[0]?.v === 1 ? `<animateTransform attributeName="transform" type="translate" values="${by}" dur="1s" fill="freeze"/>` : ''
+  return stepAnim('<animateTransform attributeName="transform" type="translate"', steps.map(p => (p.v === 1 ? by : '0 0')), steps, total, begin, isLoop)
 }
 
-function motionOf(keys: Key[], total: number, begin: number, isLoop: boolean): string {
+function motionOf(all: Key[], total: number, begin: number, isLoop: boolean): string {
+  // a run of keys at one spot needs only its ends
+  const at = (k: Key | undefined) => (k ? `${r1(k.p.x)} ${r1(k.p.y)}` : '')
+  const keys = all.filter((k, i) => i === 0 || i === all.length - 1 || at(k) !== at(all[i - 1]) || at(k) !== at(all[i + 1]))
   if (keys.length < 2) return ''
-  const values = keys.map(k => `${r1(k.p.x)} ${r1(k.p.y)}`).join(';')
+  const values = keys.map(at).join(';')
   const times = keys.map((k, i) => (i === 0 ? '0' : i === keys.length - 1 ? '1' : k4(Math.min(1, k.t / total)))).join(';')
   const repeat = isLoop ? 'repeatCount="indefinite"' : 'fill="freeze"'
   return `<animateTransform attributeName="transform" type="translate" values="${values}" keyTimes="${times}" dur="${r2(Math.max(0.1, total))}s" begin="-${r2(begin)}s" ${repeat}/>`
@@ -1345,10 +1375,10 @@ function talkBubbles(c: Resident, spans: Span[], total: number, begin: number, i
 
 // ---------- desks and machines ----------
 
-type App = 'code' | 'diff' | 'term' | 'web' | 'files' | 'notes'
+export type App = 'code' | 'diff' | 'term' | 'web' | 'files' | 'notes'
 
 // What a desk screen shows for each of Claude Code's tools.
-function appFor(tool: string | undefined): App {
+export function appFor(tool: string | undefined): App {
   if (!tool) return 'notes'
   if (/^(Edit|MultiEdit|NotebookEdit)$/.test(tool)) return 'diff'
   if (/^Write$/.test(tool)) return 'code'
@@ -1462,7 +1492,7 @@ const isCourier = (c: Resident) => c.carrying === true && !isWorking(c) && !isLe
 const isArriving = (c: Resident) => c.arriving !== undefined && !isWorking(c) && !isCourier(c) && !isLeaving(c)
 // on a walk with an end, rather than at a desk or in an idle loop
 const isOnErrand = (c: Resident) => isCourier(c) || isArriving(c) || isLeaving(c)
-const layoutKey = (L: Layout) => `${L.w}x${L.h}`
+const layoutKey = (L: Layout) => `${L.pw}x${L.ph}`
 const anchorOf = (c: Resident, L: Layout) => (c.anchor && c.anchor.key === layoutKey(L) ? c.anchor : undefined)
 const speedOf = (c: Resident) => (c.kind === 'main' ? 17 : 14) * temperament(c.id).pace
 // Heading to a new task is a brisk walk; idle strolls keep their own pace.
@@ -1500,18 +1530,17 @@ function idleStart(L: Layout, c: Resident): { room: Place; at: Pt } {
 }
 
 // Visitors from other sessions come in from the street and go back out to
-// it: the far end of the road, a few steps up from the box count, each in a
-// lane of its own.
+// it: the road where it leaves the picture, each in a lane of its own.
 function streetOf(L: Layout, id: string): Pt {
   const r = yardOf(L).road
-  return { x: (r.x0 + r.x1) / 2 + laneOf(id) * 1.5, y: r.y1 - 8 }
+  return { x: (r.x0 + r.x1) / 2 + laneOf(id) * 1.5, y: r.y1 - 12 }
 }
 
 // Another session's member, just moved in: it waits at the street out of
 // sight, steps onto the road `wait` seconds from now, and walks in by the
 // front door to its desk or to wherever it idles.
 export function arrive(c: Resident, now: number, wait = 0): Resident {
-  const L = layout()
+  const L = LAYOUT
   const p = streetOf(L, c.id)
   return { ...c, anchor: { t: now, x: p.x, y: p.y, room: 'yard', key: layoutKey(L) }, arriving: now + Math.round(wait * 1000) }
 }
@@ -1539,7 +1568,7 @@ function walkPath(L: Layout, m: Motion, fromRoom: Place, from: Pt, toRoom: Place
     const dy = p.y - last.y
     const d = Math.hypot(dx, dy)
     if (d < 0.5) continue
-    m.faces.push({ t, dir: Math.abs(dx) >= Math.abs(dy) ? (dx > 0 ? 'E' : 'W') : (dy > 0 ? 'S' : 'N') })
+    m.faces.push({ t, dir: heading(dx, dy) })
     t += d / speed
     m.keys.push({ t, p, room: p === pts[pts.length - 1] ? toRoom : roomAt(L, p, fromRoom) })
     last = p
@@ -1627,15 +1656,21 @@ function motionsOf(L: Layout, props: Prop[], list: Resident[], now: number): { w
   }
 
   const idle = idleOrder(list)
-  const meetings = huddles(L, idle, c => mod(t0Of(c, L) / 1000))
+  const resting = restingOf(idle)
+  const awake = idle.filter(c => !resting.has(c.id))
+  const meetings = huddles(L, awake, c => mod(t0Of(c, L) / 1000))
   const bookings: Bookings = new Map()
   const busy = workers.map(w => w.spot)
-  idle.forEach((c, k) => {
-    const plan = planIdle(L, props, c, idleStart(L, c), c.idleSince ?? 0, meetings.get(c.id) ?? [], {
+  for (const c of idle.filter(c => resting.has(c.id))) {
+    const start = idleStart(L, c)
+    motions.set(c.id, { ...blank(t0Of(c, L)), keys: [{ t: 0, p: start.at, room: start.room }], total: LOOP, isLoop: true, sleep: [[0, LOOP]], faces: [{ t: 0, dir: 'S' }] })
+  }
+  awake.forEach((c, k) => {
+    const plan = planIdle(L, props, c, idleStart(L, c), meetings.get(c.id) ?? [], {
       bookings,
       offset: mod(t0Of(c, L) / 1000),
       crowd: k + 1,
-      watch: c.kind === 'main' ? workers.filter(w => w.resident.id !== c.id && w.resident.session === c.session).map(w => ({ room: w.room, spot: w.spot })) : [],
+      watch: watchedBy(c, workers).map(w => ({ room: w.room, spot: w.spot })),
       busy,
     })
     motions.set(c.id, {
@@ -1663,8 +1698,8 @@ function dropOf(L: Layout, c: Resident): { at: Pt; face: Dir } {
 // When each walk with an end ends, on the clock, by id: a courier back in
 // from the pallets, a visitor in from the street or gone back out to it.
 export function errandEnds(list: Resident[], now: number): Map<string, number> {
-  const L = layout()
-  const { motions } = motionsOf(L, furnish(L).props, list, now)
+  const L = LAYOUT
+  const { motions } = motionsOf(L, PROPS, list, now)
   const out = new Map<string, number>()
   for (const c of list) {
     const m = motions.get(c.id)
@@ -1678,12 +1713,16 @@ function localTime(m: Motion, now: number): number {
   return m.isLoop ? mod(s) : Math.max(0, Math.min(s, m.total))
 }
 
+// Whom an idle lead looks in on: its own session's agents at work.
+const watchedBy = (c: Resident, workers: Worker[]) =>
+  (c.kind === 'main' ? workers.filter(w => w.resident.id !== c.id && w.resident.session === c.session) : [])
+
 // Everything an idle agent's plan is made from. Any change here means a new
 // plan, so the agent is pinned where it stands first.
 function idleSig(L: Layout, c: Resident, idle: Resident[], seniors: Resident[], workers: Worker[]): string {
   const start = idleStart(L, c).at
   const onBusy = workers.some(w => near(w.spot, start)) ? 1 : 0
-  const watch = c.kind === 'main' ? workers.filter(w => w.resident.id !== c.id && w.resident.session === c.session).map(w => `${w.room}${w.seat}`).join(',') : ''
+  const watch = watchedBy(c, workers).map(w => `${w.room}${w.seat}`).join(',')
   return `i:${c.idleSince ?? 0}:${originOf(L, c)}:${huddleKey(L, c, idle)}:${seniors.map(s => `${s.id}@${t0Of(s, L)}`).join(',')}:${onBusy}:${watch}`
 }
 
@@ -1703,8 +1742,19 @@ function signatures(L: Layout, list: Resident[]): Map<string, string> {
   for (const c of list.filter(isArriving)) out.set(c.id, `v:${c.arriving}:${c.room}:${originOf(L, c)}`)
   for (const c of list.filter(isLeaving)) out.set(c.id, `l:${c.leaving}:${originOf(L, c)}`)
   const idle = idleOrder(list)
-  idle.forEach((c, k) => out.set(c.id, idleSig(L, c, idle, idle.slice(0, k), workers)))
+  const resting = restingOf(idle)
+  const awake = idle.filter(c => !resting.has(c.id))
+  for (const c of idle) if (resting.has(c.id)) out.set(c.id, `r:${originOf(L, c)}`)
+  awake.forEach((c, k) => out.set(c.id, idleSig(L, c, awake, awake.slice(0, k), workers)))
   return out
+}
+
+// Past the few who went idle last, the idle doze where they stand, so a
+// crowd stays light to draw; a lead never does.
+const AWAKE = 6
+function restingOf(idle: Resident[]): Set<string> {
+  const others = idle.filter(c => c.kind !== 'main')
+  return new Set(others.slice(0, Math.max(0, others.length - AWAKE)).map(c => c.id))
 }
 
 // Called by the hooks on every change to the household: anyone whose plan is about
@@ -1712,13 +1762,13 @@ function signatures(L: Layout, list: Resident[]): Map<string, string> {
 // change the plans of others (those idle after it, those in its meeting
 // group), so the check goes round until nobody else's plan changes.
 export function reanchor(prev: Resident[], next: Resident[], now: number): Resident[] {
-  const L = layout()
+  const L = LAYOUT
   const before = signatures(L, prev)
   let shown: Map<string, Motion> | undefined
   const out = [...next]
   const pin = (i: number) => {
     const c = out[i] as Resident
-    shown ??= motionsOf(L, furnish(L).props, prev, now).motions
+    shown ??= motionsOf(L, PROPS, prev, now).motions
     const m = shown.get(c.id)
     if (!m || m.keys.length === 0) return
     const at = posAt(m.keys, localTime(m, now))
@@ -1776,21 +1826,30 @@ export function spotOf(t: Track, ms: number): { x: number; y: number } | undefin
 // of it is used; no percent when nothing was read.
 export type Meter = { label: string; percent?: number; color: string }
 
-// The plan's windows as compact exp bars tucked into the picture's top right
-// corner, where the garden leaves room: a row each, the label, segmented
-// cells turning amber from three quarters and red from nine tenths, as the
-// context gauge does, and the percent, flush to the corner on nothing.
+// A window's colour: its own, amber from three quarters used, red from nine
+// tenths.
+export function meterColor(m: Meter): string {
+  const p = m.percent ?? 0
+  return p >= 90 ? '#f2503f' : p >= 75 ? '#f5ac45' : m.color
+}
+
+// The plan's windows as compact exp bars in the top right corner of the
+// house's own stretch of the picture, for a picture shown with no band above
+// the prompt: a row each, the label, segmented cells turning amber from three
+// quarters and red from nine tenths, as the context gauge does, and the
+// percent, flush to the corner on nothing.
 function meterPanel(L: Layout, meters: Meter[]): string {
   const W = 60
   const ROW = 7
   const x0 = L.w - W
-  const y0 = 0
+  // in the house's own stretch of the picture
+  const y0 = L.extra ?? 0
   const parts: string[] = []
   meters.forEach((m, i) => {
     const y = y0 + i * ROW
     const known = m.percent !== undefined
     const p = m.percent ?? 0
-    const color = p >= 90 ? '#f2503f' : p >= 75 ? '#f5ac45' : m.color
+    const color = meterColor(m)
     parts.push(pixelText(m.label, x0, y, { color: known ? color : '#6b7380', cls: 'vh-ink' }))
     parts.push(pixelText(known ? `${Math.round(p)}%` : '--', x0 + W, y, { color: known ? '#d8dee9' : '#6b7380', anchor: 'end', cls: 'vh-mp' }))
     // ten cells between the label and the percent
@@ -1817,9 +1876,10 @@ function meterPanel(L: Layout, meters: Meter[]): string {
 // it, so they line up with the picture at whatever size it is shown.
 export type HouseGrid = { w: number; h: number }
 
-export function houseGrid(): HouseGrid {
-  const L = layout()
-  return { w: L.w, h: L.h }
+// `tall`: the whole tall picture; else the house's own stretch of it.
+export function houseGrid(tall = false): HouseGrid {
+  const L = LAYOUT
+  return { w: L.w, h: tall ? L.h : L.h - 2 * (L.extra ?? 0) }
 }
 
 // The house follows the app's light or dark appearance by itself: its colours
@@ -1830,18 +1890,21 @@ const LIGHT_HOUSE = '.vh-ink{filter:brightness(.6) saturate(1.35)}' +
   '.vh-glow{fill:#fff4d6}.vh-plate{fill:#ffffff}.vh-lamp{display:none}' +
   '.vh-sh{fill:#1a7f37}.vh-mp{fill:#24292f}.vh-me{fill:#eef1f5}'
 
-// The outer picture: the house, and the plan bars in its top right corner, on
-// no background of its own, so it sits on the pane's. By night (dark mode)
-// the lamps are lit; by day (light mode) the style swaps in daylight colours.
-function frame(L: Layout, body: string, style: { night: string; day: string }, meters: Meter[] | undefined): string {
+// A whole picture of the garden's or the house's, the materials `cv` used
+// in its style. By night (dark mode) the lamps are lit; by day (light mode)
+// the style swaps in daylight colours.
+function frame(L: Layout, cv: Canvas, body: string): string {
+  const used = [...cv.used.values()]
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${L.w} ${L.h}" width="${L.w * 8}" height="${L.h * 8}" shape-rendering="crispEdges" style="display:block">` +
-    `<style>${style.night}@media (prefers-color-scheme: light){${LIGHT_HOUSE}${style.day}}</style>${body}${meters && meters.length > 0 ? meterPanel(L, meters) : ''}</svg>`
+    `<style>${styleOf(used, 'night')}@media (prefers-color-scheme: light){${LIGHT_HOUSE}${styleOf(used, 'day')}}</style>${body}</svg>`
 }
 
 // ---------- the house ----------
 
-// The surface refuses an Svg source past 131,072 characters: the house is one
-// picture, and the agents stand in as many more laid over it as they fill.
+// The surface refuses an Svg source past SVG_LIMIT characters: the house is
+// one picture, and the agents stand in as many more laid over it as they
+// fill, each kept to MAX_SOURCE.
+export const SVG_LIMIT = 131072
 const MAX_SOURCE = 126000
 // The most agents drawn at once: the lead, everyone at work or carrying a
 // box, then the longest idle, so a crowd's newest idle are left out.
@@ -1851,33 +1914,84 @@ const MAX_DRAWN = 40
 // tracks of exactly the agents drawn and in sight, so the hover layer never
 // finds one a crowd left out. `boxes`: the yard's boxes in the order they
 // were shipped, each by the session that shipped it ('' for this one).
-export function housePicture(list: Resident[], boxes: string[], now: number, meters?: Meter[]): { layers: string[]; tracks: Track[] } {
-  const L = layout()
-  const { props } = furnish(L)
-  const { workers, motions } = motionsOf(L, props, list, now)
-  const errands = list.filter(isOnErrand)
-  const idleAll = list.filter(c => !isWorking(c) && !isOnErrand(c))
-  const idle = [...idleAll.filter(c => c.kind === 'main'), ...idleAll.filter(c => c.kind !== 'main').sort((a, b) => (a.idleSince ?? 0) - (b.idleSince ?? 0))]
-    .slice(0, Math.max(1, MAX_DRAWN - workers.length - errands.length))
+export function housePicture(list: Resident[], boxes: string[], now: number): { layers: string[]; tracks: Track[] } {
+  const k = castOf(list, now)
   setClock(now)
-  let house = houseLayer(L, list, boxes, now, motions, workers, errands, meters, false)
-  if (house.length > MAX_SOURCE) house = houseLayer(L, list, boxes, now, motions, workers, errands, meters, true)
-  const layers = [house, ...agentLayers(L, agentSprites(L, now, motions, workers, errands, idle))]
-  const ids = [...workers.map(w => w.resident.id), ...errands.map(c => c.id), ...idle.map(c => c.id)]
-  return { layers, tracks: ids.flatMap(id => { const m = motions.get(id); return m && m.keys.length > 0 ? [trackOf(L, id, m)] : [] }) }
+  const layers = [houseLayerIn(k, boxes, now, MAX_SOURCE), ...agentLayers(LAYOUT, agentSprites(LAYOUT, now, k.motions, k.workers, k.errands, k.idle), MAX_SOURCE)]
+  return { layers, tracks: tracksOf(k) }
 }
 
-// The house's pictures as one, each laid over the last: for a file.
-export function svg(list: Resident[], boxes: string[], now: number, meters?: Meter[]): string {
-  const L = layout()
+// The tracks alone, for a surface that draws its own house.
+export function houseTracks(list: Resident[], now: number): Track[] {
+  return tracksOf(castOf(list, now))
+}
+
+// Who is drawn and how each moves: everyone at work or on an errand, and the
+// idle up to MAX_DRAWN in all, the lead first, then the longest idle.
+type Cast = { workers: Worker[]; motions: Map<string, Motion>; errands: Resident[]; idle: Resident[]; list: Resident[] }
+function castOf(list: Resident[], now: number): Cast {
+  const { workers, motions } = motionsOf(LAYOUT, PROPS, list, now)
+  const errands = list.filter(isOnErrand)
+  const idleAll = idleOrder(list)
+  const idle = [...idleAll.filter(c => c.kind === 'main'), ...idleAll.filter(c => c.kind !== 'main')]
+    .slice(0, Math.max(1, MAX_DRAWN - workers.length - errands.length))
+  return { workers, motions, errands, idle, list }
+}
+
+function tracksOf(k: Cast): Track[] {
+  const ids = [...k.workers.map(w => w.resident.id), ...k.errands.map(c => c.id), ...k.idle.map(c => c.id)]
+  return ids.flatMap(id => { const m = k.motions.get(id); return m && m.keys.length > 0 ? [trackOf(LAYOUT, id, m)] : [] })
+}
+
+// The house's picture within `max` characters: stilled when it would not
+// fit otherwise. `meters`: the plan bars in its corner.
+function houseLayerIn(k: Cast, boxes: string[], now: number, max: number, meters?: Meter[]): string {
+  const house = houseLayer(LAYOUT, k.list, boxes, now, k.motions, k.workers, k.errands, meters, false)
+  return house.length <= max ? house : houseLayer(LAYOUT, k.list, boxes, now, k.motions, k.workers, k.errands, meters, true)
+}
+
+// The garden at `now`, a picture of its own to go under the house's: the
+// lawn over the whole tall picture and everything on it but what the house's
+// own picture draws. `reach`: the most of the picture's height, round the
+// house, that can show; the rest is left undrawn.
+export function gardenPicture(now: number, reach = Infinity): string {
+  setClock(now)
+  const L = LAYOUT
+  const half = Math.min(L.h, reach + 60) / 2
+  return gardenLayer(L, { y0: L.h / 2 - half, y1: L.h / 2 + half })
+}
+
+function gardenLayer(L: Layout, band?: { y0: number; y1: number }): string {
+  const cv = new Canvas()
+  const defs = gardenPatterns(cv)
+  const over = garden(cv, L, band)
+  return frame(L, cv, `<defs>${defs}${cv.stamped()}</defs>${cv.svg()}${over}`)
+}
+
+// The house's own stretch of the picture as one, its garden under it and the
+// plan bars in its corner: for a file or a surface that shows one picture.
+// Within `max` characters, the house is stilled and the nearest agents left
+// off as need be.
+export function svg(list: Resident[], boxes: string[], now: number, meters?: Meter[], max = Infinity): string {
+  const L = LAYOUT
+  const y0 = L.extra ?? 0
+  const { w, h } = houseGrid()
   const size = (layer: string) => layer.replace(`width="${L.w * 8}" height="${L.h * 8}"`, `width="${L.w}" height="${L.h}"`)
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${L.w} ${L.h}" width="${L.w * 8}" height="${L.h * 8}">` +
-    `${housePicture(list, boxes, now, meters).layers.map(size).join('')}</svg>`
+  const k = castOf(list, now)
+  setClock(now)
+  const under = gardenLayer(L, { y0, y1: y0 + h })
+  const open = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 ${y0} ${w} ${h}" width="${w * 8}" height="${h * 8}">`
+  let room = max - open.length - '</svg>'.length - under.length
+  const house = houseLayerIn(k, boxes, now, room, meters)
+  room -= house.length
+  const [agents] = agentLayers(L, agentSprites(L, now, k.motions, k.workers, k.errands, k.idle), room, true)
+  return `${open}${[under, house, ...(agents ? [agents] : [])].map(size).join('')}</svg>`
 }
 
-// The agents laid over the house, farthest first, in as few pictures as hold
-// them, each with the shared parts its own agents use.
-function agentLayers(L: Layout, sprites: { depth: number; svg: string }[]): string[] {
+// The agents laid over the house, farthest first, in as few pictures of at
+// most `max` characters as hold them, each with the shared parts its own
+// agents use; `once`: in one picture only, whoever fits.
+function agentLayers(L: Layout, sprites: { depth: number; svg: string }[], max: number, once = false): string[] {
   const pictures: string[] = []
   let parts = new Map<string, string>()
   let body = ''
@@ -1888,11 +2002,27 @@ function agentLayers(L: Layout, sprites: { depth: number; svg: string }[]): stri
     body = ''
     size = 0
   }
-  const needs = (svg: string) => [...new Set([...svg.matchAll(/href="#([\w-]+)"/g)].map(m => m[1] as string))].filter(id => bodyDefs.has(id))
+  const needs = (svg: string) => {
+    const ids = new Set<string>()
+    const visit = (text: string) => {
+      for (const m of text.matchAll(/(?:href="#|url\(#)([\w-]+)/g)) {
+        const id = m[1] as string
+        if (ids.has(id) || !bodyDefs.has(id)) continue
+        ids.add(id)
+        visit(bodyDefs.get(id) ?? '')
+      }
+    }
+    visit(svg)
+    return [...ids]
+  }
   for (const s of sprites) {
-    const more = (ids: string[]) => ids.filter(id => !parts.has(id)).reduce((n, id) => n + (bodyDefs.get(id)?.length ?? 0), 0)
-    if (body && 600 + size + more(needs(s.svg)) + s.svg.length > MAX_SOURCE) close()
-    for (const id of needs(s.svg)) {
+    const ids = needs(s.svg)
+    const more = ids.filter(id => !parts.has(id)).reduce((n, id) => n + (bodyDefs.get(id)?.length ?? 0), 0)
+    if (600 + size + more + s.svg.length > max) {
+      if (once) break
+      if (body) close()
+    }
+    for (const id of ids) {
       if (parts.has(id)) continue
       const def = bodyDefs.get(id) ?? ''
       parts.set(id, def)
@@ -1915,16 +2045,16 @@ function heatOf(c: Resident, now: number): number {
   return Math.min(1, (c.calls ?? []).reduce((sum, t) => sum + Math.exp(-Math.max(0, now - t) / 8000), 0) / 3)
 }
 
-// The house and its garden, everyone's desks, lamps and labels, and the plan
-// bars in the corner: everything but the agents.
+// The house, its road and yard and the trees round it, everyone's desks,
+// lamps and labels, and the plan bars in the corner: everything but the
+// agents and the garden under it all.
 function houseLayer(
   L: Layout, list: Resident[], boxes: string[], now: number,
   motions: Map<string, Motion>, workers: Worker[], errands: Resident[], meters: Meter[] | undefined, still: boolean,
 ): string {
   const cv = new Canvas()
-  const patternDefs = patterns(cv) + gardenPatterns(cv)
-  // the garden first: the island, and the trees behind the house
-  ground(cv, L)
+  const patternDefs = patterns(cv)
+  // the road and the trees behind the house first
   road(cv, L)
   treesBehind(cv, L)
   const leaves = weather(cv, L)
@@ -2014,7 +2144,7 @@ function houseLayer(
   cv.raw(lamps(cv, L))
 
   const body = `<defs>${patternDefs}${cv.stamped()}</defs>` + cv.svg() + labels.join('') + leaves.front
-  return frame(L, body, { night: nightStyle(cv.used.values()), day: dayStyle(cv.used.values()) }, meters)
+  return frame(L, cv, body + (meters && meters.length > 0 ? meterPanel(L, meters) : ''))
 }
 
 // Everyone, as sprites with how near each stands, to be laid farthest first.
@@ -2040,7 +2170,7 @@ function agentSprites(L: Layout, now: number, motions: Map<string, Motion>, work
       const ask = fitText(c.waitingTool ? `APPROVE ${c.waitingTool}?` : 'AWAITING APPROVAL', 56, PX)
       const w2 = textWidth(ask, PX) + 7
       bubbles += `<g transform="translate(${r1(-w2 / 2)} -24)"><rect x="0" y="0" width="${r1(w2)}" height="6" fill="#1a1004" opacity="0.75"/>` +
-        `<g>${pixelText(ask, 2, 1.3, { color: '#f5c47a' })}<animate attributeName="opacity" values="0.6;1;0.6" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/></g>` +
+        `<g>${agentText(ask, 2, 1.3, { color: '#f5c47a' })}<animate attributeName="opacity" values="0.6;1;0.6" dur="2s" ${loopBegin(2)} repeatCount="indefinite"/></g>` +
         `<rect x="${r1(w2 - 3)}" y="1.5" width="1.2" height="3" fill="#f7dcae">${blinkAnim('opacity', '1', '0', 1000)}</rect></g>`
     } else if (bornAge < 4.2) {
       bubbles += group(textBubble('on my way'), track([[0, 4.2]], 4.3, bornAge, false))

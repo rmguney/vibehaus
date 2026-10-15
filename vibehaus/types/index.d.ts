@@ -41,10 +41,6 @@ export type Resident = {
   isTeammate?: boolean
   // the tool a permission prompt is asking about
   waitingTool?: string
-  // what it ran on and how busy it has been
-  model?: string
-  tools?: number
-  errors?: number
   // its last few tool calls, for how hot its desk runs
   calls?: number[]
   // the lead's context window use, in percent
@@ -71,31 +67,9 @@ export type Resident = {
   endingSince?: number
 }
 
-// One row of the tasks list under the house.
-export type TaskRow = {
-  id: string
-  group: 'Lead' | 'Agents' | 'Shells' | 'Monitors' | 'Workflows' | 'Other'
-  title: string
-  detail: string
-  state: 'running' | 'waiting' | 'pending' | 'idle' | 'done' | 'failed' | 'stopped'
-  // absent when the start was never seen, so no made-up time is shown
-  startedAt?: number
-  endedAt?: number
-  // its tokens over the week, ready to show: "3.9M"
-  usage?: string
-  // the session it belongs to, when another's
-  session?: string
-}
-
-// A session sharing the house, for its own section of the tasks list: its id
-// ('' for this one), its name and its colour.
-export type Household = { id: string; name: string; color: string }
-
-// The line of numbers at the top of the tasks list.
-export type TaskStats = { shippedToday: number; toolsPerMinute: number }
-
-// The plan's five-hour and weekly windows in percent, for the exp bars in the
-// house's corner; a window with no reading is left out.
+// The plan's five-hour and weekly windows in percent, for the vibe fatigue
+// band (and the bars in the house's corner where there is no band); a window
+// with no reading is left out.
 export type PlanUse = { fiveHour?: number; week?: number }
 
 // One agent's walk across the house as plain data, replayed to place its hover
@@ -108,6 +82,6 @@ export type Track = { id: string; t0: number; total: number; isLoop: boolean; ke
 
 declare module 'claude-code' {
   interface PluginState {
-    'vibehaus': { residents: Resident[]; plan: PlanUse; scroll: number; page: number; toggled: string[] }
+    'vibehaus': { residents: Resident[]; plan: PlanUse }
   }
 }

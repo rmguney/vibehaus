@@ -80,8 +80,8 @@ function rug(cv: Canvas, L: Layout, x: number, y: number, w: number, d: number, 
 }
 
 // Something that flickers or glows, drawn as pixels with its own animation.
-function lit(pts: Pt[], fill: string, anim: string, cls = ''): string {
-  return `<path${cls ? ` class="${cls}"` : ''} fill="${fill}" d="${pathOf(pts)}">${anim}</path>`
+function lit(pts: Pt[], fill: string, anim: string): string {
+  return `<path fill="${fill}" d="${pathOf(pts)}">${anim}</path>`
 }
 
 // Steam curling up from a point, one wisp after another.
@@ -188,7 +188,7 @@ function workshop(cv: Canvas, L: Layout, c: Cell): void {
   plant(cv, L, c.x + 35, c.y + 35, false)
 }
 
-function lounge(cv: Canvas, L: Layout, c: Cell): string {
+function lounge(cv: Canvas, L: Layout, c: Cell): void {
   rug(cv, L, c.x + 15, c.y + 21, 22, 15, RUG.lounge)
   for (let k = 0; k < 2; k++) {
     const y = c.y + 1 + 11 * k
@@ -216,7 +216,6 @@ function lounge(cv: Canvas, L: Layout, c: Cell): string {
   box(cv, L, c.x + 28.5, c.y + 13, 1.5, 5, 5, F.couch)
   cv.layer()
   plant(cv, L, c.x + 35, c.y + 35, true)
-  return ''
 }
 
 // A room's own furniture (not its desks), and any animated bits to lay over.
@@ -227,7 +226,7 @@ export function furniture(cv: Canvas, L: Layout, room: Room, c: Cell): string {
     case 'sunroom': return sunroom(cv, L, c)
     case 'kitchen': return kitchen(cv, L, c)
     case 'workshop': workshop(cv, L, c); return ''
-    case 'lounge': return lounge(cv, L, c)
+    case 'lounge': lounge(cv, L, c); return ''
   }
 }
 

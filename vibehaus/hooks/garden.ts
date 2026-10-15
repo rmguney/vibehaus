@@ -1,20 +1,25 @@
 /*
- * The garden: autumn lawn filling the picture around the house, its edge
- * ragged with tufts of long grass, under oaks, maples and birches in full
- * colour, a few dark pines, and shrubs. The trees stand in the four gaps the
- * house leaves at the picture's corners, clear of every room. Crowns sway in
- * the wind and leaves come loose and drift down.
+ * The garden: an autumn lawn filling the whole picture round the house, in
+ * mottled grass strewn with tufts, fallen leaves and flowers, under oaks,
+ * maples and birches in full colour, dark pines and shrubs: a few round the
+ * house's corners, and copses and lone trees about the rest, with open lawn
+ * between them, ponds big and small, flower beds, stones and toadstools.
+ * Crowns sway in the wind and leaves come loose and drift down; by night
+ * fireflies wander.
  *
- * All of it is drawn on the picture itself, not on the floor plan.
+ * All of it is drawn on the picture itself, not on the floor plan. The lawn
+ * and what lies on it are a picture of their own, under the house's.
  */
 import { TALL_WALL } from './house'
 import type { Layout } from './house'
-import { loopBegin, mat } from './iso'
-import type { Canvas, Mat, Pt } from './iso'
-import { yardShapes } from './yard'
+import { Canvas, loopBegin, mat, rng } from './iso'
+import type { Mat, Pt } from './iso'
+import { signAt, yardShapes } from './yard'
 
 const G = {
   grass: mat('na', '#2f3b27', '#9aa24c'),
+  lit: mat('nl', '#35432c', '#a7ae56'),
+  shade: mat('nh', '#29341f', '#8c9443'),
   speck: mat('ns', '#3a4730', '#b3b35a'),
   dry: mat('nd', '#4a4228', '#c9a85a'),
   dark: mat('nk', '#232c1d', '#6f7a34'),
@@ -27,8 +32,12 @@ const G = {
   water: mat('wa', '#16202e', '#5d8fb0'),
   ripple: mat('wr', '#2a3a52', '#9cc6e0'),
   post: mat('lp', '#1c1f24', '#3a3f47'),
-  soil: mat('so', '#2a1d14', '#7a5634'),
   lamp: mat('ll', '#ffd27a', '#e8dcc0'),
+  stone: mat('sn', '#3d4046', '#a9aeb5'),
+  stoneLit: mat('sl', '#585c63', '#cfd3d8'),
+  aster: mat('fa', '#6a4a9a', '#a77fe0'),
+  mum: mat('fm', '#a8822a', '#ffd166'),
+  rose: mat('fr', '#8f2a3a', '#e0566e'),
 }
 
 type Kind = 'oak' | 'maple' | 'birch' | 'pine' | 'bush'
@@ -51,18 +60,6 @@ const BUILD: Record<Kind, { trunk: number; rx: number; ry: number; lean: number;
   birch: { trunk: 15, rx: 8, ry: 12, lean: 3, beat: 3.6 },
   pine: { trunk: 5, rx: 11, ry: 16, lean: 1.2, beat: 5.2 },
   bush: { trunk: 0, rx: 7, ry: 4.5, lean: 2, beat: 3.3 },
-}
-
-// A seeded generator, so the garden is the same on every redraw.
-function rng(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0
-    let t = a
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
 }
 
 // A rounded blob: an octagon about `c`.
@@ -89,213 +86,115 @@ const lerp = (a: Pt, b: Pt, u: number, dy = 0): Pt => ({ x: Math.round(a.x + (b.
 
 // ---------- the lawn ----------
 
-// The lawn's edge is where a soft field around everything that stands on it
-// fades out: the house, each tree and bush, the road with its pallets and
-// mailbox, the pond and the lamps. Their fields melt into one
-// another, so the lawn hugs the house, swells round the trees and bridges
-// the gaps between them without running far past anything, and a faint
-// ripple keeps the edge from looking drawn with a compass.
-type Field = { reach: number; dist: (p: Pt) => number }
-
-const EDGE = 0.32
-// how far the soil shows under the grass's lower edge
-const SOIL = 3
-
-const around = (c: Pt, core: number, reach: number): Field => ({ reach, dist: p => Math.max(0, Math.hypot(p.x - c.x, p.y - c.y) - core) })
-
-// 0 inside a convex outline, else the way out to its nearest edge.
-function within(poly: Pt[], reach: number): Field {
-  return {
-    reach,
-    dist: p => {
-      let pos = false
-      let neg = false
-      let best = Infinity
-      poly.forEach((a, i) => {
-        const b = poly[(i + 1) % poly.length] as Pt
-        const ex = b.x - a.x
-        const ey = b.y - a.y
-        const cross = ex * (p.y - a.y) - ey * (p.x - a.x)
-        if (cross > 0) pos = true
-        if (cross < 0) neg = true
-        const t = Math.max(0, Math.min(1, ((p.x - a.x) * ex + (p.y - a.y) * ey) / (ex * ex + ey * ey || 1)))
-        best = Math.min(best, Math.hypot(p.x - a.x - t * ex, p.y - a.y - t * ey))
-      })
-      return pos && neg ? best : 0
-    },
-  }
-}
-
-// A smooth, seeded wobble between 0 and 1, `scale` pixels across.
-function wobble(seed: number, scale: number): (p: Pt) => number {
-  const at = (i: number, j: number) => (Math.imul(Math.imul(i, 73856093) ^ Math.imul(j, 19349663) ^ seed, 2654435761) >>> 0) / 4294967296
-  const ease = (t: number) => t * t * (3 - 2 * t)
-  return p => {
-    const x = p.x / scale
-    const y = p.y / scale
-    const i = Math.floor(x)
-    const j = Math.floor(y)
-    const u = ease(x - i)
-    const v = ease(y - j)
-    const a = at(i, j)
-    const b = at(i + 1, j)
-    const c = at(i, j + 1)
-    const d = at(i + 1, j + 1)
-    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v
-  }
-}
-
 const pondAt = (L: Layout) => lerp(corners(L).bottom, corners(L).right, 0.42, 18)
 const lampsAt = (L: Layout) => [lerp(corners(L).left, corners(L).bottom, 0.62, 9), lerp(corners(L).bottom, corners(L).right, 0.45, 9)]
 const toadstoolsAt = (L: Layout) => [lerp(corners(L).left, corners(L).bottom, 0.5, 26), lerp(corners(L).bottom, corners(L).right, 0.2, 24), lerp(corners(L).left, corners(L).top, 0.24, -30)]
 
-function fields(L: Layout): Field[] {
-  const c = corners(L)
-  const up = (q: Pt, dy: number) => ({ x: q.x, y: q.y - dy })
-  const yard = yardShapes(L)
-  const pond = pondAt(L)
-  return [
-    // the house, its tall back walls and the base under its front edges
-    within([up(c.left, TALL_WALL), up(c.top, TALL_WALL), up(c.right, TALL_WALL), up(c.right, -3), up(c.bottom, -3), up(c.left, -3)], 15),
-    ...TREES.map(t => around(place(L, t), 2, BUILD[t.kind].rx + (t.kind === 'bush' ? 6 : 9))),
-    within(yard.road, 10),
-    ...yard.pallets.map(p => within(p, 9)),
-    around(yard.mailbox, 1, 9),
-    { reach: 9, dist: (p: Pt) => Math.max(0, Math.hypot((p.x - pond.x) / 13, (p.y - pond.y) / 5) - 1) * 5 },
-    ...lampsAt(L).map(p => around(p, 1, 9)),
-  ]
+// How far a point lies outside a convex outline: 0 inside.
+function outside(poly: Pt[], p: Pt): number {
+  let pos = false
+  let neg = false
+  let best = Infinity
+  poly.forEach((a, i) => {
+    const b = poly[(i + 1) % poly.length] as Pt
+    const ex = b.x - a.x
+    const ey = b.y - a.y
+    const cross = ex * (p.y - a.y) - ey * (p.x - a.x)
+    if (cross > 0) pos = true
+    if (cross < 0) neg = true
+    const t = Math.max(0, Math.min(1, ((p.x - a.x) * ex + (p.y - a.y) * ey) / (ex * ex + ey * ey || 1)))
+    best = Math.min(best, Math.hypot(p.x - a.x - t * ex, p.y - a.y - t * ey))
+  })
+  return pos && neg ? best : 0
 }
 
-// The lawn as one pixel per point of the picture, worked out once.
-let lawnMask: Uint8Array | undefined
+// A clump of longer grass, `n` blades about (x, y).
+function blades(cv: Canvas, r: () => number, x: number, y: number, n: number): void {
+  for (let k = 0; k < n; k++) {
+    const tall = 2 + Math.floor(r() * 4)
+    const bx = Math.round(x + (k - n / 2) * 1.2 + r())
+    cv.rect(bx, Math.round(y) - tall, 1, tall, k % 3 === 0 ? G.dark : G.blade)
+    if (r() < 0.4) cv.rect(bx, Math.round(y) - tall, 1, 1, G.tip)
+  }
+}
 
-function lawn(L: Layout): Uint8Array {
-  if (lawnMask) return lawnMask
-  const all = fields(L)
-  const ripple = wobble(5, 9)
-  const mask = new Uint8Array(L.w * L.h)
-  for (let y = 0; y < L.h - SOIL - 1; y++) {
-    for (let x = 0; x < L.w; x++) {
-      const p = { x: x + 0.5, y: y + 0.5 }
-      let f = (ripple(p) - 0.5) * 0.16
-      for (const k of all) {
-        const t = k.dist(p) / k.reach
-        if (t < 1) f += (1 - t * t) ** 2
+// A pond `rx` by `ry` about `at`, a ripple or two on it and a leaf or two
+// afloat.
+type Pond = { at: Pt; rx: number; ry: number }
+
+function pond(cv: Canvas, { at: p, rx, ry }: Pond): void {
+  const k = (n: number) => Math.round((n * rx) / 12)
+  blob(cv, { x: p.x + 1, y: p.y + 1 }, rx + 1, ry + 0.5, G.dark)
+  blob(cv, p, rx, ry, G.water)
+  cv.layer()
+  cv.rect(p.x - k(6), p.y - k(2), Math.max(2, k(5)), 1, G.ripple)
+  cv.rect(p.x - k(2), p.y, 2, 1, LEAF[0] as Mat)
+  if (rx < 9) return
+  cv.rect(p.x + 3, p.y + 1, 4, 1, G.ripple)
+  cv.rect(p.x + 6, p.y - 2, 1, 1, LEAF[2] as Mat)
+}
+
+function toadstool(cv: Canvas, p: Pt): void {
+  cv.rect(p.x, p.y - 1, 1, 1, G.birch)
+  cv.rect(p.x - 1, p.y - 2, 3, 1, G.cap)
+}
+
+// The lawn's patterns, each tile a different size so their repeats never
+// line up: the grass, mottled; patches of it a shade lighter or darker, a
+// tile the picture's width, each patch a few blobs run together, wrapped at
+// the tile's edges; tufts of longer grass; fallen leaves; small flowers.
+const PATCHES = { w: 248, h: 173 }
+// drawn once: the same for every picture
+let patchTile: Canvas | undefined
+
+function patchesTile(): Canvas {
+  if (patchTile) return patchTile
+  const patches = new Canvas()
+  const lawn = rng(7)
+  for (let n = Math.round((PATCHES.w * PATCHES.h) / 2600); n > 0; n--) {
+    const p = { x: lawn() * PATCHES.w, y: lawn() * PATCHES.h }
+    const m = lawn() < 0.5 ? G.lit : G.shade
+    for (let k = 1 + Math.floor(lawn() * 3); k > 0; k--) {
+      const q = { x: Math.round(p.x + (lawn() - 0.5) * 20), y: Math.round(p.y + (lawn() - 0.5) * 8) }
+      const [rx, ry] = [7 + lawn() * 10, 3 + lawn() * 4]
+      for (const dx of [0, -PATCHES.w, PATCHES.w]) {
+        for (const dy of [0, -PATCHES.h, PATCHES.h]) {
+          const c = { x: q.x + dx, y: q.y + dy }
+          if (c.x + rx >= 0 && c.x - rx <= PATCHES.w && c.y + ry >= 0 && c.y - ry <= PATCHES.h) blob(patches, c, rx, ry, m)
+        }
       }
-      if (f >= EDGE) mask[y * L.w + x] = 1
     }
   }
-  lawnMask = mask
-  return mask
+  patchTile = patches
+  return patches
 }
 
-// The lawn's pixel runs, row by row, `dy` rows lower; with `keep`, only the
-// pixels it keeps.
-function runsOf(L: Layout, dy = 0, keep: (x: number, y: number) => boolean = () => true): [number, number, number][] {
-  const mask = lawn(L)
-  const out: [number, number, number][] = []
-  for (let y = 0; y < L.h; y++) {
-    let start = -1
-    for (let x = 0; x <= L.w; x++) {
-      const on = x < L.w && mask[y * L.w + x] === 1 && keep(x, y)
-      if (on && start < 0) start = x
-      if (!on && start >= 0) {
-        out.push([y + dy, start, x - start])
-        start = -1
-      }
-    }
-  }
-  return out
-}
-
-const onLawn = (L: Layout, p: Pt) => {
-  const x = Math.floor(p.x)
-  const y = Math.floor(p.y)
-  return x >= 0 && y >= 0 && x < L.w && y < L.h && lawn(L)[y * L.w + x] === 1
-}
-
-// The lawn: mottled grass on a little soil, light along its upper edge with
-// a tuft here and there, clumps of longer grass, fallen leaves, a pond and a
-// few toadstools.
-export function ground(cv: Canvas, L: Layout): void {
-  const r = rng(7)
-  const c = corners(L)
-  const mask = lawn(L)
-  const isLawn = (x: number, y: number) => x >= 0 && y >= 0 && x < L.w && y < L.h && mask[y * L.w + x] === 1
-  // the soil, showing under the grass's lower edge, a dark seam over it
-  cv.region(runsOf(L, SOIL), G.soil)
-  cv.layer()
-  cv.region(runsOf(L, 1), G.dark)
-  cv.layer()
-  cv.region(runsOf(L), 'url(#grass)')
-  cv.layer()
-  // light along the top edge, and a tuft every so often standing up from it
-  const top = (x: number, y: number) => !isLawn(x, y - 1)
-  cv.region(runsOf(L, 0, top), G.blade)
-  cv.layer()
-  const tuft = wobble(11, 5)
-  for (const [y, x0, w] of runsOf(L, 0, top)) {
-    for (let x = x0; x < x0 + w; x++) {
-      if (tuft({ x, y }) < 0.78 || (x + y) % 3 !== 0) continue
-      cv.rect(x, y - 2, 1, 2, G.blade)
-      cv.rect(x, y - 2, 1, 1, G.tip)
-    }
-  }
-  cv.layer()
-  const blades = (x: number, y: number, n: number) => {
-    for (let k = 0; k < n; k++) {
-      const tall = 2 + Math.floor(r() * 4)
-      const bx = Math.round(x + (k - n / 2) * 1.2 + r())
-      cv.rect(bx, Math.round(y) - tall, 1, tall, k % 3 === 0 ? G.dark : G.blade)
-      if (r() < 0.4) cv.rect(bx, Math.round(y) - tall, 1, 1, G.tip)
-    }
-  }
-  const clumps = [
-    lerp(c.left, c.bottom, 0.18, 22), lerp(c.left, c.bottom, 0.62, 16), lerp(c.bottom, c.right, 0.28, 20),
-    lerp(c.bottom, c.right, 0.86, 16), lerp(c.left, c.top, 0.15, -20), lerp(c.top, c.right, 0.84, -16),
-    { x: c.left.x - 4, y: c.left.y + 6 }, { x: c.right.x + 4, y: c.right.y + 6 },
-  ]
-  for (const p of clumps) if (onLawn(L, p)) blades(p.x, p.y, 5 + Math.floor(r() * 3))
-  // a pond in the gap at the right, a leaf or two afloat
-  const pond = pondAt(L)
-  blob(cv, { x: pond.x + 1, y: pond.y + 1 }, 13, 5, G.dark)
-  blob(cv, pond, 12, 4.5, G.water)
-  cv.layer()
-  cv.rect(pond.x - 6, pond.y - 2, 5, 1, G.ripple)
-  cv.rect(pond.x + 3, pond.y + 1, 4, 1, G.ripple)
-  cv.rect(pond.x - 2, pond.y, 2, 1, LEAF[0] as Mat)
-  cv.rect(pond.x + 6, pond.y - 2, 1, 1, LEAF[2] as Mat)
-  for (const p of toadstoolsAt(L).filter(q => onLawn(L, q))) {
-    cv.rect(p.x, p.y - 1, 1, 1, G.birch)
-    cv.rect(p.x - 1, p.y - 2, 3, 1, G.cap)
-  }
-  // leaves fallen on the lawn, thickest under the trees
-  for (const t of TREES) {
-    const at = place(L, t)
-    const b = BUILD[t.kind]
-    for (let i = 0; i < (t.kind === 'pine' ? 0 : 4); i++) {
-      const p = { x: Math.round(at.x - b.rx + r() * b.rx * 2), y: Math.round(at.y - 2 + r() * 5) }
-      const wide = r() < 0.5
-      const leaf = LEAF[Math.floor(r() * LEAF.length)] as Mat
-      if (onLawn(L, p)) cv.rect(p.x, p.y, wide ? 2 : 1, 1, leaf)
-    }
-  }
-  for (let i = 0; i < 40; i++) {
-    const p = { x: r() * L.w, y: r() * L.h }
-    if (!onLawn(L, p)) continue
-    cv.rect(Math.round(p.x), Math.round(p.y), r() < 0.5 ? 2 : 1, 1, LEAF[Math.floor(r() * LEAF.length)] as Mat)
-  }
-  cv.layer()
-}
-
-// The grass, a mottled pattern on the picture's own grid.
 export function gardenPatterns(cv: Canvas): string {
   const use = (m: Mat) => {
     cv.used.set(m.cls, m)
     return `class="${m.cls}"`
   }
-  return `<pattern id="grass" width="6" height="4" patternUnits="userSpaceOnUse"><rect width="6" height="4" ${use(G.grass)}/>` +
-    `<path ${use(G.speck)} d="M1 0h1v1h-1zM4 2h1v1h-1zM2 3h2v1h-2z"/><path ${use(G.dry)} d="M5 1h1v1h-1z"/></pattern>`
+  const patches = patchesTile()
+  for (const [k, m] of patches.used) cv.used.set(k, m)
+  const tile = (id: string, w: number, h: number, body: string) => `<pattern id="${id}" width="${w}" height="${h}" patternUnits="userSpaceOnUse">${body}</pattern>`
+  const dots = (m: Mat, d: string) => `<path ${use(m)} d="${d}"/>`
+  return tile('grass', 16, 12, `<rect width="16" height="12" ${use(G.grass)}/>` +
+      dots(G.speck, 'M1 1h1v1h-1zM6 3h1v1h-1zM11 0h1v1h-1zM14 5h1v1h-1zM3 7h1v1h-1zM9 8h2v1h-2zM13 10h1v1h-1zM5 11h1v1h-1zM0 4h1v1h-1z') +
+      dots(G.dark, 'M4 2h1v1h-1zM12 3h1v1h-1zM7 6h1v1h-1zM2 9h1v1h-1zM15 8h1v1h-1zM10 11h1v1h-1z') +
+      dots(G.dry, 'M8 1h1v1h-1zM1 6h1v1h-1zM12 7h1v1h-1z') +
+      dots(G.blade, 'M3 4h1v2h-1zM10 5h1v2h-1zM6 9h1v2h-1zM14 1h1v2h-1z')) +
+    tile('tufts', 29, 23,
+      dots(G.blade, 'M2 3h1v3h-1zM4 4h1v2h-1zM17 9h1v3h-1zM19 10h1v2h-1zM9 16h1v3h-1zM11 17h1v2h-1zM24 19h1v3h-1zM26 20h1v2h-1z') +
+      dots(G.tip, 'M2 3h1v1h-1zM17 9h1v1h-1zM9 16h1v1h-1zM24 19h1v1h-1z') +
+      dots(G.dark, 'M3 6h1v1h-1zM18 12h1v1h-1zM10 19h1v1h-1zM25 22h1v1h-1z')) +
+    tile('leaves', 43, 37,
+      dots(LEAF[0] as Mat, 'M5 7h2v1h-2zM30 22h1v1h-1z') + dots(LEAF[1] as Mat, 'M18 3h1v1h-1zM37 30h2v1h-2z') +
+      dots(LEAF[2] as Mat, 'M12 26h2v1h-2zM40 12h1v1h-1z') + dots(LEAF[3] as Mat, 'M24 15h1v1h-1zM2 33h2v1h-2z')) +
+    tile('patches', PATCHES.w, PATCHES.h, patches.svg()) +
+    tile('flowers', 61, 47,
+      dots(G.aster, 'M7 9h1v1h-1zM9 10h1v1h-1zM44 33h1v1h-1z') + dots(G.mum, 'M29 20h1v1h-1zM31 19h1v1h-1zM52 6h1v1h-1z') +
+      dots(G.rose, 'M17 38h1v1h-1zM19 39h1v1h-1zM38 44h1v1h-1z') +
+      dots(G.dark, 'M7 10h1v1h-1zM9 11h1v1h-1zM44 34h1v1h-1zM29 21h1v1h-1zM31 20h1v1h-1zM52 7h1v1h-1zM17 39h1v1h-1zM19 40h1v1h-1zM38 45h1v1h-1z'))
 }
 
 // One kind's crown about the top of its trunk, (0, 0), swaying in the wind;
@@ -372,18 +271,24 @@ function place(L: Layout, t: Spot): Pt {
   return lerp(c[t.from], c[t.to], t.u, t.dy)
 }
 
-// A tree on the lawn: its trunk, and its kind's swaying crown.
+// A tree on the lawn round the house.
 function tree(cv: Canvas, L: Layout, t: Spot): void {
-  const at = place(L, t)
-  const b = BUILD[t.kind]
-  if (b.trunk > 0) {
-    cv.rect(at.x - 1, at.y - b.trunk, 1, b.trunk, t.kind === 'birch' ? G.birch : G.trunk)
-    cv.rect(at.x, at.y - b.trunk, 1, b.trunk, t.kind === 'birch' ? G.trunk : G.bark)
-    cv.layer()
-  }
-  // the crown, drawn once per kind about its own pivot, placed on the trunk
-  cv.define(`crown-${t.kind}`, { x: 0, y: 0 }, sub => crown(sub, t.kind))
-  cv.raw(`<use href="#crown-${t.kind}" x="${at.x}" y="${at.y - b.trunk}"/>`)
+  treeAt(cv, t.kind, place(L, t))
+}
+
+// A tree standing at `at`: a copy of its kind, drawn once whole (the trunk,
+// and the crown swaying on it), so each tree is one element.
+function treeAt(cv: Canvas, kind: Kind, at: Pt): void {
+  const b = BUILD[kind]
+  cv.define(`crown-${kind}`, sub => crown(sub, kind))
+  cv.define(`tree-${kind}`, sub => {
+    if (b.trunk > 0) {
+      sub.rect(-1, -b.trunk, 1, b.trunk, kind === 'birch' ? G.birch : G.trunk)
+      sub.rect(0, -b.trunk, 1, b.trunk, kind === 'birch' ? G.trunk : G.bark)
+    }
+    sub.raw(`<use href="#crown-${kind}" y="${-b.trunk}"/>`)
+  })
+  cv.raw(`<use href="#tree-${kind}" x="${at.x}" y="${at.y}"/>`)
 }
 
 export function treesBehind(cv: Canvas, L: Layout): void {
@@ -399,10 +304,19 @@ export function frontTrees(L: Layout): { depth: number; draw: (cv: Canvas) => vo
 
 // Whether a point of the picture lies over the house, its tall back walls
 // included, with a little room to spare.
-function overHouse(L: Layout, p: Pt): boolean {
+const hulls = new WeakMap<Layout, Pt[]>()
+function hullOf(L: Layout): Pt[] {
+  const known = hulls.get(L)
+  if (known) return known
   const c = corners(L)
   const up = (q: Pt) => ({ x: q.x, y: q.y - TALL_WALL })
   const hull = [up(c.left), up(c.top), up(c.right), c.right, c.bottom, c.left]
+  hulls.set(L, hull)
+  return hull
+}
+
+function overHouse(L: Layout, p: Pt): boolean {
+  const hull = hullOf(L)
   return hull.every((a, i) => {
     const b = hull[(i + 1) % hull.length] as Pt
     return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) > -3 * Math.hypot(b.x - a.x, b.y - a.y)
@@ -423,23 +337,227 @@ export function weather(cv: Canvas, L: Layout): { behind: string; front: string 
     let path: Pt[] = []
     let isBehind = false
     for (let tries = 0; tries < 6 && path.length === 0; tries++) {
-      const sx = Math.round(top.x - b.rx * 0.6 + r() * b.rx * 1.2)
-      const sy = Math.round(top.y - b.trunk - b.ry * 1.5 + r() * b.ry)
-      const fall = 24 + Math.round(r() * 24)
-      const drift = 8 + Math.round(r() * 16)
-      const tried = [0, 1, 2, 3, 4].map(k => ({ x: Math.round(sx + (drift * k) / 4 + (k % 2 ? 3 : 0)), y: Math.round(sy + (fall * k) / 4) }))
+      const tried = leafPath(r, top, b, 24, 16)
       isBehind = t.dy < 0 && tried.some(p => overHouse(L, p))
       if (isBehind || tried.every(p => !overHouse(L, p))) path = tried
     }
     if (path.length === 0) continue
-    const dur = Math.round((6 + r() * 5) * 10) / 10
-    const lead = Math.round(r() * 100) / 10
-    const leaf = LEAF[i % LEAF.length] as Mat
-    cv.used.set(leaf.cls, leaf)
-    out[isBehind ? 'behind' : 'front'] += `<rect class="${leaf.cls}" width="2" height="1" opacity="0">` +
-      `<animateTransform attributeName="transform" type="translate" values="${path.map(p => `${p.x} ${p.y}`).join(';')}" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/>` +
-      `<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.8;1" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/>` +
-      `<animate attributeName="width" values="2;1" calcMode="discrete" dur="0.7s" ${loopBegin(0.7)} repeatCount="indefinite"/></rect>`
+    out[isBehind ? 'behind' : 'front'] += fallingLeaf(cv, LEAF[i % LEAF.length] as Mat, path, r)
   }
   return out
+}
+
+// A leaf's way down from somewhere in the crown of a tree standing at `foot`,
+// falling up to twice `fall` and drifting up to 8 + `drift` as it goes.
+function leafPath(r: () => number, foot: Pt, b: (typeof BUILD)[Kind], fall: number, drift: number): Pt[] {
+  const sx = Math.round(foot.x - b.rx * 0.6 + r() * b.rx * 1.2)
+  const sy = Math.round(foot.y - b.trunk - b.ry * 1.5 + r() * b.ry)
+  const f = fall + Math.round(r() * fall)
+  const d = 8 + Math.round(r() * drift)
+  return [0, 1, 2, 3, 4].map(k => ({ x: Math.round(sx + (d * k) / 4 + (k % 2 ? 3 : 0)), y: Math.round(sy + (f * k) / 4) }))
+}
+
+// One leaf drifting down `path`, on a beat of its own.
+function fallingLeaf(cv: Canvas, leaf: Mat, path: Pt[], r: () => number): string {
+  const dur = Math.round((6 + r() * 5) * 10) / 10
+  const lead = Math.round(r() * 100) / 10
+  cv.used.set(leaf.cls, leaf)
+  return `<rect class="${leaf.cls}" width="2" height="1" opacity="0">` +
+    `<animateTransform attributeName="transform" type="translate" values="${path.map(p => `${p.x} ${p.y}`).join(';')}" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/>` +
+    `<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.8;1" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/>` +
+    `<animate attributeName="width" values="2;1" calcMode="discrete" dur="0.7s" ${loopBegin(0.7)} repeatCount="indefinite"/></rect>`
+}
+
+// ---------- the garden round the house ----------
+
+// What grows on the lawn past the house's own trees, laid out once per
+// layout from a fixed seed: copses of a kind or two of tree with a bush or
+// two at their edges, a tree on its own here and there, open lawn between
+// them with a pond or two and smaller ones, reeds, flower beds, stones and
+// toadstools. Nothing stands on the house, its trees, the road or the yard,
+// and no crown reaches over them, so the house's picture over the garden's
+// never cuts one wrongly.
+// `own`: the house's trees where they stand; `order`: the grove's trees back
+// to front; `leafy`: those that drop leaves.
+type Standing = { kind: Kind; at: Pt }
+type Grove = {
+  trees: Standing[]; ponds: Pond[]; beds: { at: Pt; n: number }[]; stones: Pt[]; clumps: Pt[]; toadstools: Pt[]
+  own: Standing[]; order: Standing[]; leafy: Standing[]
+}
+const groves = new Map<string, Grove>()
+
+function groveOf(L: Layout): Grove {
+  const key = `${L.w}x${L.h}x${L.oy}`
+  const known = groves.get(key)
+  if (known) return known
+  const r = rng(29)
+  const c = corners(L)
+  const up = (q: Pt, dy: number) => ({ x: q.x, y: q.y - dy })
+  const hull = [up(c.left, TALL_WALL + 6), up(c.top, TALL_WALL + 6), up(c.right, TALL_WALL + 6), up(c.right, -6), up(c.bottom, -6), up(c.left, -6)]
+  const yard = yardShapes(L)
+  const sign = signAt(L)
+  const own = TREES.map(t => ({ kind: t.kind, at: place(L, t) }))
+  const lit = lampsAt(L)
+  const wet0 = pondAt(L)
+  // whether anything of the house, its trees or the yard is within `m` of p
+  const blocked = (p: Pt, m: number) =>
+    outside(hull, p) < m || outside(yard.road, p) < m + 4 || yard.pallets.some(q => outside(q, p) < m + 4) ||
+    Math.hypot(p.x - yard.mailbox.x, p.y - yard.mailbox.y) < m + 8 || Math.hypot(p.x - sign.x - 6, p.y - sign.y - 3) < m + 10 ||
+    own.some(q => Math.hypot(p.x - q.at.x, (p.y - q.at.y) * 0.8) < m + 24) || lit.some(q => Math.hypot(p.x - q.x, p.y - q.y) < m + 6) ||
+    Math.hypot((p.x - wet0.x) / 2, p.y - wet0.y) < m + 10
+  // a tree's whole reach, trunk foot to crown top, kept clear
+  const clear = (kind: Kind, at: Pt) => {
+    const b = BUILD[kind]
+    const top = at.y - b.trunk - 2 * b.ry
+    return [at, { x: at.x - b.rx, y: at.y - b.trunk - b.ry }, { x: at.x + b.rx, y: at.y - b.trunk - b.ry }, { x: at.x, y: top }]
+      .every(p => !blocked(p, 3))
+  }
+  const grove: Grove = { trees: [], ponds: [], beds: [], stones: [], clumps: [], toadstools: [], own, order: [], leafy: [] }
+  const near = (at: Pt, list: Pt[], d: number) => list.some(q => Math.hypot(q.x - at.x, (q.y - at.y) * 1.5) < d)
+  const spaced = (at: Pt, d: number) => !near(at, grove.trees.map(t => t.at), d)
+  // candidate spots on a jittered grid, taken in a shuffled order
+  const spots = (step: number) => {
+    const out: Pt[] = []
+    for (let y = 42; y <= L.h - 4; y += step) for (let x = 6; x <= L.w - 6; x += step) out.push({ x: Math.round(x + (r() - 0.5) * step), y: Math.round(y + (r() - 0.5) * step) })
+    for (let i = out.length - 1; i > 0; i--) {
+      const k = Math.floor(r() * (i + 1))
+      ;[out[i], out[k]] = [out[k] as Pt, out[i] as Pt]
+    }
+    return out
+  }
+  // up to `max` spots `gap` apart that pass `ok`
+  const scatter = (step: number, max: number, gap: number, ok: (p: Pt) => boolean) => {
+    const out: Pt[] = []
+    for (const p of spots(step)) if (out.length < max && ok(p) && !near(p, out, gap)) out.push(p)
+    return out
+  }
+  const pick = <T,>(list: T[]) => list[Math.floor(r() * list.length)] as T
+  // the copses, each of a kind or two, a bush or two at its edge
+  const MIXES: Kind[][] = [['oak', 'maple'], ['birch'], ['pine'], ['maple', 'birch'], ['pine', 'oak'], ['oak', 'maple', 'birch'], ['pine', 'birch']]
+  for (const p of scatter(23, Math.round(L.h / 46), 52, p => !blocked(p, 12))) {
+    const mix = pick(MIXES)
+    for (let n = 2 + Math.floor(r() * 4), tries = 0; n > 0 && tries < 30; tries++) {
+      const at = { x: Math.round(p.x + (r() - 0.5) * 50), y: Math.round(p.y + (r() - 0.5) * 24) }
+      const kind = pick(mix)
+      if (spaced(at, 17) && clear(kind, at)) (grove.trees.push({ kind, at }), n--)
+    }
+    for (let n = Math.floor(r() * 3), tries = 0; n > 0 && tries < 12; tries++) {
+      const at = { x: Math.round(p.x + (r() - 0.5) * 64), y: Math.round(p.y + 8 + r() * 10) }
+      if (spaced(at, 13) && clear('bush', at)) (grove.trees.push({ kind: 'bush', at }), n--)
+    }
+  }
+  // a tree or a bush on its own here and there
+  for (const at of scatter(29, Math.round(L.h / 32), 28, p => spaced(p, 28))) {
+    const kind = pick<Kind>(['oak', 'maple', 'birch', 'pine', 'bush', 'bush'])
+    if (clear(kind, at)) grove.trees.push({ kind, at })
+  }
+  // ponds where it is clearest of every tree: a big one or two, smaller ones
+  const wet = (p: Pt) => Math.min(99, ...grove.trees.map(t => Math.hypot((t.at.x - p.x) / 1.7, t.at.y - p.y)))
+  const pondSpots = spots(13).filter(p => p.x > 20 && p.x < L.w - 20 && !blocked(p, 14)).map(p => ({ p, w: wet(p) })).sort((a, b) => b.w - a.w)
+  const apart = (p: Pt, d: number) => grove.ponds.every(q => Math.hypot(q.at.x - p.x, (q.at.y - p.y) * 1.5) > d + q.rx)
+  for (const { p, w } of pondSpots) if (grove.ponds.length < Math.max(1, Math.round(L.h / 300)) && w > 16 && apart(p, 90)) grove.ponds.push({ at: p, rx: 12, ry: 4.5 })
+  for (const { p, w } of pondSpots) {
+    if (grove.ponds.length >= Math.round(L.h / 300) + Math.round(L.h / 120)) break
+    const rx = 6 + Math.floor(r() * 4)
+    if (w > rx + 6 && apart(p, 36)) grove.ponds.push({ at: p, rx, ry: rx * 0.4 })
+  }
+  const dry = (p: Pt, m: number) => !blocked(p, m) && grove.ponds.every(q => Math.hypot((p.x - q.at.x) / (q.rx + 3), (p.y - q.at.y) / (q.ry + 2)) > 1.4)
+  // reeds at the ponds' edges, longer grass about the lawn
+  for (const q of grove.ponds) grove.clumps.push({ x: q.at.x + (r() < 0.5 ? -1 : 1) * Math.round(q.rx * 0.8), y: Math.round(q.at.y + q.ry * 0.5) })
+  grove.clumps.push(...scatter(17, Math.round(L.h / 30), 22, p => dry(p, 2) && spaced(p, 10)))
+  // flower beds, stones in ones and twos, toadstools at a few trees' feet
+  grove.beds.push(...scatter(19, Math.round(L.h / 34), 28, p => dry(p, 6) && spaced(p, 16)).map(at => ({ at, n: Math.floor(r() * 3) })))
+  for (const p of scatter(31, Math.round(L.h / 70), 40, p => dry(p, 3) && spaced(p, 10))) {
+    grove.stones.push(p)
+    if (r() < 0.5) grove.stones.push({ x: p.x + 4, y: p.y + 1 })
+  }
+  for (const t of grove.trees) if (t.kind !== 'bush' && r() < 0.18) grove.toadstools.push({ x: t.at.x + (r() < 0.5 ? -5 : 4), y: t.at.y + 2 })
+  // nothing wholly off the picture
+  grove.trees = grove.trees.filter(t => t.at.x + BUILD[t.kind].rx > 0 && t.at.x - BUILD[t.kind].rx < L.w)
+  grove.toadstools = grove.toadstools.filter(p => p.x > -2 && p.x < L.w + 1)
+  grove.order = [...grove.trees].sort((a, b) => a.at.y - b.at.y || a.at.x - b.at.x)
+  grove.leafy = grove.trees.filter(t => t.kind !== 'pine' && t.kind !== 'bush')
+  groves.set(key, grove)
+  return grove
+}
+
+// The garden under the house: the lawn over the whole picture, a shade
+// lighter here and darker there, strewn with tufts, leaves and flowers; then
+// the ponds, beds, stones and grass round the house; then the grove's trees
+// back to front (the house's own are in its picture). Gives back what drifts over all of it: leaves coming loose, and
+// by night a few fireflies. `band`: only what shows between those rows, the
+// rest as it would be had it all been drawn.
+export function garden(cv: Canvas, L: Layout, band = { y0: 0, y1: L.h }): string {
+  const c = corners(L)
+  const grove = groveOf(L)
+  // whether a thing standing at y, `tall` above it, shows in the band
+  const shows = (y: number, tall = 0) => y + 8 >= band.y0 && y - tall - 8 <= band.y1
+  const [y0, y1] = [Math.max(0, band.y0), Math.min(L.h, band.y1)]
+  cv.rect(0, y0, L.w, y1 - y0, 'url(#grass)')
+  cv.layer()
+  for (const id of ['patches', 'tufts', 'leaves', 'flowers']) cv.rect(0, y0, L.w, y1 - y0, `url(#${id})`)
+  cv.layer()
+  // round the house: clumps of long grass, its pond and toadstools
+  const tufts = rng(8)
+  const clumps = [
+    lerp(c.left, c.bottom, 0.18, 22), lerp(c.left, c.bottom, 0.62, 16), lerp(c.bottom, c.right, 0.28, 20),
+    lerp(c.bottom, c.right, 0.86, 16), lerp(c.left, c.top, 0.15, -20), lerp(c.top, c.right, 0.84, -16),
+    { x: c.left.x - 4, y: c.left.y + 6 }, { x: c.right.x + 4, y: c.right.y + 6 },
+  ]
+  for (const p of clumps) blades(cv, tufts, p.x, p.y, 5 + Math.floor(tufts() * 3))
+  grove.clumps.forEach((p, i) => shows(p.y, 6) && blades(cv, rng(200 + i), p.x, p.y, 3 + (i % 4)))
+  pond(cv, { at: pondAt(L), rx: 12, ry: 4.5 })
+  for (const p of grove.ponds) if (shows(p.at.y + p.ry, 2 * p.ry)) pond(cv, p)
+  for (const p of [...toadstoolsAt(L), ...grove.toadstools]) if (shows(p.y)) toadstool(cv, p)
+  for (const s of grove.stones) {
+    if (!shows(s.y)) continue
+    blob(cv, { x: s.x + 0.5, y: s.y + 0.5 }, 2.6, 1.6, G.stone)
+    cv.rect(s.x - 1, s.y - 1, 2, 1, G.stoneLit)
+  }
+  // leaves fallen thickest under the trees, the house's and the groves'
+  const litter = rng(9)
+  for (const t of [...grove.own, ...grove.trees]) {
+    const b = BUILD[t.kind]
+    for (let i = 0; i < (t.kind === 'pine' ? 0 : 3); i++) {
+      const [x, y, w, m] = [Math.round(t.at.x - b.rx + litter() * b.rx * 2), Math.round(t.at.y - 2 + litter() * 5), litter() < 0.5 ? 2 : 1, LEAF[Math.floor(litter() * LEAF.length)] as Mat]
+      if (shows(y)) cv.rect(x, y, w, 1, m)
+    }
+  }
+  cv.layer()
+  // flower beds, each drawn once and copied
+  for (const b of grove.beds) {
+    if (!shows(b.at.y)) continue
+    cv.stamp(`bed${b.n}`, b.at, sub => {
+      const m = [G.aster, G.mum, G.rose][b.n] as Mat
+      const br = rng(41 + b.n)
+      for (let k = 0; k < 14; k++) {
+        const p = { x: Math.round(b.at.x + (br() - 0.5) * 13), y: Math.round(b.at.y + (br() - 0.5) * 5) }
+        sub.rect(p.x, p.y, 1, 1, G.dark)
+        sub.rect(p.x, p.y - 1, 1, 1, k % 4 === 0 ? G.mum : m)
+      }
+    })
+  }
+  const crownOf = (kind: Kind) => BUILD[kind].trunk + 2 * BUILD[kind].ry
+  for (const t of grove.order) if (shows(t.at.y, crownOf(t.kind))) treeAt(cv, t.kind, t.at)
+  let over = ''
+  const { leafy } = grove
+  const falling = Math.min(10, leafy.length)
+  for (let i = 0; i < falling; i++) {
+    const t = leafy[Math.floor((i * leafy.length) / falling)] as Standing
+    if (!shows(t.at.y, crownOf(t.kind))) continue
+    const r = rng(60 + i)
+    over += fallingLeaf(cv, LEAF[i % LEAF.length] as Mat, leafPath(r, t.at, BUILD[t.kind], 20, 14), r)
+  }
+  const flies = rng(12)
+  for (let i = 0; i < Math.min(12, Math.round(L.h / 45)); i++) {
+    const p = { x: Math.round(L.w * 0.08 + flies() * L.w * 0.84), y: Math.round(10 + flies() * (L.h - 20)) }
+    const dur = Math.round((5 + flies() * 4) * 10) / 10
+    const lead = Math.round(flies() * 50) / 10
+    if (overHouse(L, p) || !shows(p.y)) continue
+    const loop = [[0, 0], [4, -3], [7, 1], [3, 4], [0, 0]].map(([dx, dy]) => `${p.x + (dx as number)} ${p.y + (dy as number)}`).join(';')
+    over += `<rect class="vh-lamp" width="1" height="1" fill="#ffe08a" opacity="0">` +
+      `<animateTransform attributeName="transform" type="translate" values="${loop}" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/>` +
+      `<animate attributeName="opacity" values="0;0.9;0.2;0.9;0" dur="${dur}s" ${loopBegin(dur, lead)} repeatCount="indefinite"/></rect>`
+  }
+  return over
 }

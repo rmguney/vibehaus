@@ -1,14 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { Resident, ResidentStatus, Household, PlanUse, Room, TaskRow, TaskStats, Track } from '../types'
-import { hostCells, hostSvg, linesOf, pagesOf, SPIN_MS, spinCells, spinSvg } from './lines'
-import type { Acts, Live, Marks } from './lines'
-import { cardSvg, listItems, tasksPanel } from './panel'
-import { cellAt, packCells, planCells, planOf, planSize, reachOf } from './plan'
+import type { Resident, ResidentStatus, PlanUse, Room, Track } from '../types'
+import { cardSvg } from './cards'
+import { ALL_ROOMS } from './house'
+import { cellAt, gardenRaster, packCells, planCells, planOf, planSize, reachOf } from './plan'
 import type { Plan, Walker } from './plan'
 import type { HouseGrid, Meter } from './scene'
-import { arrive, clip, colorFor, displayName, errandEnds, houseGrid, housePicture, paintSessions, reanchor, spotOf, svg, taskTypeOf } from './scene'
+import {
+  arrive, clip, colorFor, displayName, errandEnds, gardenPicture, houseGrid, housePicture, houseTracks, meterColor, paintSessions, reanchor,
+  spotOf, svg, SVG_LIMIT, taskTypeOf,
+} from './scene'
 
 const PANE = 'vibehaus'
 const MAIN = 'main'
@@ -18,37 +20,6 @@ const MAX_CALLS = 8
 
 const residents = atom({ plugin: 'vibehaus', key: 'residents' } as const, [])
 const plan = atom({ plugin: 'vibehaus', key: 'plan' } as const, {})
-// how far down the terminal's tasks list is scrolled, in rows
-const listScroll = atom({ plugin: 'vibehaus', key: 'scroll' } as const, 0)
-// which page of the desktop's tasks list shows
-const listPage = atom({ plugin: 'vibehaus', key: 'page' } as const, 0)
-// the sessions whose sections of the list a click turned from how they
-// start: this one folded, another opened
-const toggledSessions = atom({ plugin: 'vibehaus', key: 'toggled' } as const, [])
-
-// The terminal's list as last drawn, for its scrollbar and the wheel: how
-// far it scrolls, how many of its rows show, how many it has.
-let listView: { maxTop: number; shown: number; total: number } | undefined
-
-// In the terminal the list scrolls in the rows under the house, by the
-// wheel, NOTCH rows a tick, or the scroll keys, a scrollbar beside it
-// showing where it stands.
-const SCROLLBAR = 'vh-scrollbar'
-const NOTCH = 3
-
-// On the desktop the pane is the surface's own scroll box, and everything in
-// it scrolls together, the house too. So the pane's tree is never taller than
-// the pane: the house and its bars stay put, and the list under them shows a
-// page at a time, turned by buttons. How many of its lines fit under the house
-// turns on how tall a pane row is against a column, which says how many rows
-// the house picture takes, and which the pane does not say: code fonts run
-// from about 2.3 (a tall face, tight lines) to 2.8 (a narrow one, loose lines)
-// times. A page fills to the high end, the pane's edge cutting what does not
-// fit, and the next page starts where the low end would have cut it. The
-// buttons take a row or two.
-const ROW_RATIOS = { low: 2.3, high: 2.8 }
-const CONTROL_ROWS = { low: 2, high: 1 }
-
 // The next redraw, `ms` on: the pictures catch up, and the hover zones move
 // on with the sprites.
 let nextDraw: { cancel: () => void } | undefined
@@ -71,12 +42,16 @@ function redrawSoon($: EngineInterface, ms: number): void {
 
 // The house in the terminal, its floor plan played by the plugin a frame at
 // a time into a Raster (see plan.ts): the plan and its walkers as last
-// drawn, and the timer painting its frames while it is shown.
+// drawn, the cells last shown, and the timer painting its frames while it is
+// shown. A frame the same as the last is not sent.
 const RASTER = 'vh-house'
 const FRAME_MS = 200
 let played: { plan: Plan; walkers: Walker[] } | undefined
+let shownCells: Uint32Array | undefined
 let frames: { cancel: () => void } | undefined
 let isPainting = false
+
+const sameCells = (a: Uint32Array, b: Uint32Array | undefined) => b !== undefined && a.length === b.length && a.every((v, i) => v === b[i])
 
 function playHouse($: EngineInterface): void {
   if (frames) return
@@ -93,9 +68,12 @@ async function paintFrame($: EngineInterface): Promise<void> {
   isPainting = true
   try {
     const now = await $.clock.now()
-    const done = await $.ui.blit({ requestId: PANE, key: RASTER, cells: packCells(planCells(house.plan, house.walkers, now)) })
+    const cells = planCells(house.plan, house.walkers, now)
+    if (sameCells(cells, shownCells)) return
+    const done = await $.ui.blit({ requestId: PANE, key: RASTER, cells: packCells(cells) })
     // not shown, or resized: the next redraw starts it again
     if (done.deny) stopHouse()
+    else shownCells = cells
   } catch {
     stopHouse()
   } finally {
@@ -107,62 +85,7 @@ function stopHouse(): void {
   frames?.cancel()
   frames = undefined
   played = undefined
-}
-
-// The list's moving parts in the terminal (the Host's line, a running
-// task's spinner), each a Raster repainted at the spinner's pace while shown.
-let liveParts: Live[] = []
-let liveFrames: { cancel: () => void } | undefined
-let isLivePainting = false
-
-function playLive($: EngineInterface, parts: Live[]): void {
-  liveParts = parts
-  if (parts.length === 0) return stopLive()
-  if (liveFrames) return
-  try {
-    liveFrames = $.clock.every(SPIN_MS, () => void paintLive($))
-  } catch {
-    // no timer: they move on with each redraw instead
-  }
-}
-
-async function paintLive($: EngineInterface): Promise<void> {
-  if (isLivePainting) return
-  isLivePainting = true
-  try {
-    const now = await $.clock.now()
-    let shown = 0
-    for (const part of liveParts) {
-      const done = await $.ui.blit({ requestId: PANE, key: part.key, cells: packCells(part.paint(now)) }).catch(() => ({ deny: 'gone' }))
-      if (!done.deny) shown++
-    }
-    // not shown, or drawn without them: the next redraw starts it again
-    if (shown === 0) stopLive()
-  } finally {
-    isLivePainting = false
-  }
-}
-
-function stopLive(): void {
-  liveFrames?.cancel()
-  liveFrames = undefined
-  liveParts = []
-}
-
-// A running task's stop button: Claude Code's own TaskStop, called as the
-// model would call it and through the same permission check; once it went,
-// the task ends here as stopped. A demo task only ends.
-async function stopTask($: EngineInterface, id: string): Promise<void> {
-  const c = (await read($, residents)).find(m => m.id === id)
-  if (!c || c.session || !isLive(c)) return
-  if (!c.isDemo) {
-    const done = await $.tool.call({ tool: 'TaskStop', task_id: id })
-    if (done.deny !== undefined || done.isError) {
-      $.ui.toast(`Could not stop ${displayName(c)}: ${done.deny ?? done.text ?? 'TaskStop failed'}`)
-      return
-    }
-  }
-  await finish($, id, 'Stopped')
+  shownCells = undefined
 }
 
 // Who a permission prompt is for: the agent it names, else the one at work
@@ -175,10 +98,6 @@ async function askFor($: EngineInterface, agentId: string | undefined, message: 
     .filter(c => !c.session && c.status === 'working' && (tool === undefined || c.tool === tool))
     .sort((a, b) => lastCall(b) - lastCall(a))[0]?.id ?? MAIN
   await move($, asking, c => (c.status === 'working' ? { status: 'waiting', waitingTool: tool ?? c.tool } : {}))
-}
-
-async function foldSession($: EngineInterface, id: string): Promise<void> {
-  await update($, toggledSessions, ids => (ids.includes(id) ? ids.filter(k => k !== id) : [...ids, id]))
 }
 
 const LEAD: Resident = {
@@ -199,7 +118,7 @@ function roomForKind(kind: string): Room {
 }
 
 // One line, short enough for a label: a heredoc must not end up in the
-// state, a picture's alt text or the task list.
+// state or a picture's alt text.
 function oneLine(text: string): string {
   return clip(text.replace(/\s+/g, ' ').trim(), MAX_TEXT)
 }
@@ -343,14 +262,6 @@ async function join($: EngineInterface, member: Resident): Promise<void> {
   await change($, base => settle([...base.filter(c => c.id !== member.id), member]))
 }
 
-// How a task ended, from the engine's word for it.
-function endOf(word: string): 'done' | 'failed' | 'stopped' {
-  const w = word.toLowerCase()
-  if (/kill|stop|cancel|abort/.test(w)) return 'stopped'
-  if (/fail|error/.test(w)) return 'failed'
-  return 'done'
-}
-
 // Store writes that read first go one at a time, so two hooks of this
 // session never both count from the same old value.
 let storeQueue: Promise<unknown> = Promise.resolve()
@@ -372,9 +283,6 @@ function dayOf(now: number): string {
   const d = new Date(now)
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
-
-// A session's day as written: when each of its boxes went, or, written
-// before the times were kept, how many.
 
 async function readShipped($: EngineInterface, now: number): Promise<void> {
   const day = dayOf(now)
@@ -415,6 +323,8 @@ async function yardBoxes($: EngineInterface, now: number): Promise<string[]> {
 // A finished agent or task carries a box out to the pallets by the mailbox
 // (see `deliver`), and real work counts towards the day's total.
 async function finish($: EngineInterface, id: string, activity: string): Promise<void> {
+  const member = (await read($, residents)).find(c => c.id === id)
+  if (!member || member.status === 'done' || member.session) return
   const now = await $.clock.now()
   // the next free place on the pallets, with every session's latest counted
   await readShipped($, now).catch(() => undefined)
@@ -468,22 +378,20 @@ function ordered(list: Resident[]): Resident[] {
   return list.map((c, i) => ({ c, i })).sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i).map(x => x.c)
 }
 
-const GROUP: Record<string, TaskRow['group']> = { subagent: 'Agents', shell: 'Shells', monitor: 'Monitors', workflow: 'Workflows' }
+// Where a member stands, for its hover card.
+type State = 'running' | 'waiting' | 'pending' | 'idle' | 'done' | 'failed' | 'stopped'
 
 // How a task ended, from the engine's word when it gave one.
-function endState(c: Resident): TaskRow['state'] {
-  return endOf(c.taskStatus ?? c.activity)
+function endState(c: Resident): State {
+  const w = (c.taskStatus ?? c.activity).toLowerCase()
+  if (/kill|stop|cancel|abort/.test(w)) return 'stopped'
+  if (/fail|error/.test(w)) return 'failed'
+  return 'done'
 }
 
-const STATE_WORD: Record<TaskRow['state'], string> = {
+const STATE_WORD: Record<State, string> = {
   running: 'running', waiting: 'awaiting approval', pending: 'pending', idle: 'waiting for you',
   done: 'completed', failed: 'failed', stopped: 'stopped',
-}
-
-// "claude-haiku-4-5-20251001" reads as "Haiku 4.5", as the app names it
-function shortModel(model: string): string {
-  const name = model.replace(/^claude-/, '').replace(/-\d{8}$/, '').replace(/-(\d+)-(\d+)$/, ' $1.$2').replace(/-(\d+)$/, ' $1')
-  return name.charAt(0).toUpperCase() + name.slice(1)
 }
 
 // ---------- token usage, kept as time and token pairs ----------
@@ -507,7 +415,7 @@ function addUsage(usage: number[] | undefined, now: number, tokens: number): num
   }
   kept.push(now, tokens)
   // past the cap, the two oldest entries merge under the older time, so old
-  // tokens age out of the hour and the week when they should
+  // tokens age out of the week no later than they should
   while (kept.length > MAX_USAGE) {
     kept[1] = (kept[1] ?? 0) + (kept[3] ?? 0)
     kept.splice(2, 2)
@@ -522,7 +430,7 @@ function compact(n: number): string {
   return `${(n / 1e6).toFixed(1)}M`
 }
 
-// Tokens over the week, the one figure the list shows: the lead's spans
+// Tokens over the week, as the hover cards show them: the lead's spans
 // sessions, anyone else's is its one run.
 function usageText(c: Resident, now: number): string | undefined {
   const week = tokensSince(c.usage, now - WEEK)
@@ -550,13 +458,22 @@ async function leadKey($: EngineInterface): Promise<string> {
 
 const numbers = (v: unknown) => (Array.isArray(v) ? v.filter((n): n is number => typeof n === 'number') : [])
 
-// Undefined when the store cannot be read, so the session's own figures stand.
+// Every session's, an hour to an entry, under the hour's latest time, so the
+// lead's figure stays small however many sessions there were. Undefined when
+// the store cannot be read, so the session's own figures stand.
 async function leadUsage($: EngineInterface): Promise<number[] | undefined> {
   try {
     const keys = (await $.store.keys()).filter(k => k.startsWith(LEAD_USAGE))
-    const all: number[] = []
-    for (const key of keys) all.push(...numbers(await $.store.get(key)))
-    return all
+    const hours = new Map<number, [number, number]>()
+    for (const key of keys) {
+      const v = numbers(await $.store.get(key))
+      for (let i = 0; i + 1 < v.length; i += 2) {
+        const [t, n] = [v[i] ?? 0, v[i + 1] ?? 0]
+        const was = hours.get(Math.floor(t / HOUR))
+        hours.set(Math.floor(t / HOUR), [Math.max(t, was?.[0] ?? 0), n + (was?.[1] ?? 0)])
+      }
+    }
+    return [...hours.values()].sort((a, b) => a[0] - b[0]).flat()
   } catch {
     return undefined
   }
@@ -599,7 +516,7 @@ async function recordUsage($: EngineInterface, id: string, tokens: number): Prom
   await update($, residents, list => list.map(c => (c.id === id ? { ...c, usage: addUsage(c.usage, now, tokens) } : c)))
 }
 
-// ---------- the plan's windows, for the exp bars in the house's corner ----------
+// ---------- the plan's windows, for the vibe fatigue band ----------
 
 // The five-hour and weekly windows as Claude Code itself last read them,
 // off its latest response: nothing leaves the machine for them. A window it
@@ -613,6 +530,9 @@ async function refreshPlan($: EngineInterface): Promise<void> {
   if (now.fiveHour !== was.fiveHour || now.week !== was.week) await update($, plan, () => now)
 }
 
+// Cells in each of the band's plan bars.
+const BAR = 8
+
 function metersOf(p: PlanUse): Meter[] {
   return [
     { label: '5H', color: '#52d2f5', ...(p.fiveHour !== undefined ? { percent: p.fiveHour } : {}) },
@@ -620,61 +540,12 @@ function metersOf(p: PlanUse): Meter[] {
   ]
 }
 
-// Where a member stands, as the tasks list words it.
-function stateOf(c: Resident): TaskRow['state'] {
+// Where a member stands, as its hover card words it.
+function stateOf(c: Resident): State {
   if (c.kind === 'main') return c.status === 'waiting' ? 'waiting' : c.status === 'working' ? 'running' : 'idle'
   if (c.status === 'waiting') return 'waiting'
   if (isLive(c)) return c.taskStatus === 'pending' ? 'pending' : 'running'
   return endState(c)
-}
-
-// The tasks list: the lead first, then every subagent, shell, monitor
-// and workflow, grouped by kind, running ones first.
-function taskRows(list: Resident[], now: number): TaskRow[] {
-  const rows: TaskRow[] = []
-  for (const c of list) {
-    if (c.kind === 'main') {
-      const state = stateOf(c)
-      // what it is doing, as the chat's working line says it
-      const lead: TaskRow = {
-        id: c.id, group: 'Lead', state,
-        title: state === 'running' ? c.activity || 'Working' : state === 'waiting' ? `Awaiting approval${c.waitingTool ? ` for ${c.waitingTool}` : ''}` : 'Waiting for you',
-        detail: [displayName(c), c.context !== undefined ? `context ${Math.round(c.context)}%` : ''].filter(Boolean).join(' · '),
-      }
-      if (state !== 'idle' && c.workSince) lead.startedAt = c.workSince
-      const used = usageText(c, now)
-      if (used) lead.usage = used
-      if (c.session) lead.session = c.session
-      rows.push(lead)
-      continue
-    }
-    const type = taskTypeOf(c)
-    const running = isLive(c)
-    const state = stateOf(c)
-    const isAgent = type === 'subagent'
-    const doing = running && c.activity && c.activity !== c.name && c.activity !== 'Starting up' ? c.activity : ''
-    const tools = c.tools ? `${c.tools} tool${c.tools === 1 ? '' : 's'}${c.errors ? `, ${c.errors} failed` : ''}` : ''
-    const parts = isAgent
-      ? [displayName(c), c.model ? shortModel(c.model) : '', c.status === 'waiting' && c.waitingTool ? `wants ${c.waitingTool}` : STATE_WORD[state], tools, doing]
-      : [displayName(c), STATE_WORD[state]]
-    // plain data only: no field left undefined
-    const row: TaskRow = {
-      id: c.id,
-      group: GROUP[type] ?? 'Other',
-      title: isAgent ? c.name : c.activity || c.name,
-      detail: parts.filter(Boolean).join(' · '),
-      state,
-    }
-    const startedAt = c.spawnedAt ?? c.workSince
-    if (startedAt !== undefined && startedAt > 0) row.startedAt = startedAt
-    if (!running && c.doneAt !== undefined) row.endedAt = c.doneAt
-    const used = usageText(c, now)
-    if (used) row.usage = used
-    if (c.session) row.session = c.session
-    rows.push(row)
-  }
-  const rank = (r: TaskRow) => (r.state === 'done' || r.state === 'failed' || r.state === 'stopped' ? 1 : 0)
-  return rows.sort((a, b) => rank(a) - rank(b))
 }
 
 function ended(status: string): string {
@@ -704,7 +575,6 @@ function fromSummary(t: TaskSummary): Resident {
     name: isAgent ? description || kind : `Background ${t.type}`,
     kind,
     room: isAgent ? roomForKind(kind) : t.type === 'shell' || t.type === 'monitor' ? 'kitchen' : t.server ? 'sunroom' : 'study',
-   
     // when it started is unknown: no start time rather than a wrong one
     movedAt: 0,
     status: 'working',
@@ -739,7 +609,7 @@ async function reconcile($: EngineInterface, tasks: readonly TaskSummary[] | und
     const synced = list.map((c): Resident => {
       if (c.session) return c
       const t = live.get(c.id)
-      if (t) return c.status === 'done' ? c : { ...c, taskType: t.type, taskStatus: t.status }
+      if (t) return c.status === 'done' ? c : { ...without(c, 'endingSince'), taskType: t.type, taskStatus: t.status }
       const seen = c.spawnedAt ?? c.workSince
       const isOld = seen === undefined || seen < asOf
       // a teammate, working or idle, ends when the engine no longer lists it
@@ -802,8 +672,8 @@ const PEER = 'session:'
 const SYNC_EVERY = 3000
 const BEAT_EVERY = 10000
 const GONE_AFTER = 35000
-const FORGET_AFTER = 60 * 60 * 1000
-const ACTIVE_FOR = 5 * 60 * 60 * 1000
+const FORGET_AFTER = HOUR
+const ACTIVE_FOR = 5 * HOUR
 // seconds between visitors setting off up the road together
 const ARRIVE_GAP = 1.5
 
@@ -817,17 +687,18 @@ type Peer = { id: string; name: string; since: number }
 // This session as the others know it, its name as every house shows it, and
 // the others as last read.
 let self: { id: string; name: string; since: number } | undefined
-let selfName = ''
 let peers: Peer[] = []
 let lastSync = 0
 let shared = { at: 0, text: '' }
 let publishing: { cancel: () => void } | undefined
 let sharing: Promise<void> | undefined
+// each start of sharing, so one stopped while it starts knows to give up
+let runs = 0
 let beats: { cancel: () => void }[] = []
 
 const peerName = (id: string) => peers.find(p => p.id === id)?.name ?? 'another session'
 
-async function whoAmI($: EngineInterface): Promise<void> {
+async function whoAmI($: EngineInterface): Promise<NonNullable<typeof self>> {
   const now = await $.clock.now()
   const id = await $.session.id().catch(() => 'local')
   const root = await $.session.root().catch(() => '')
@@ -835,8 +706,7 @@ async function whoAmI($: EngineInterface): Promise<void> {
   // the name it went by before a reload: its title, once it had one
   const was = await $.store.get(PEER + id).catch(() => undefined) as Partial<Snapshot> | undefined
   const name = typeof was?.name === 'string' && was.name ? was.name : root.split(/[\\/]/).filter(Boolean).pop() ?? 'session'
-  self = { id, name, since: since || now }
-  selfName = self.name
+  return { id, name, since: since || now }
 }
 
 // A session goes by its title as the app shows it, once the engine names it
@@ -848,7 +718,6 @@ async function retitle($: EngineInterface, title: string | undefined): Promise<v
   const me = self
   if (!me || me.name === name) return
   me.name = name
-  selfName = name
   await publish($)
 }
 
@@ -876,7 +745,7 @@ async function publish($: EngineInterface, beat = false): Promise<void> {
   await $.store.set(PEER + me.id, { ...body, at: now } satisfies Snapshot)
 }
 
-const ROOMS = new Set<string>(['study', 'library', 'workshop', 'kitchen', 'sunroom', 'lounge'])
+const ROOMS = new Set<string>(ALL_ROOMS)
 const STATUSES = new Set<string>(['working', 'waiting', 'idle', 'done'])
 
 // Another session's member as it wrote it, checked field by field: a field
@@ -889,11 +758,11 @@ function memberOf(raw: unknown): Resident | undefined {
   const { id, kind, name, room, status } = { id: text('id'), kind: text('kind'), name: text('name'), room: text('room'), status: text('status') }
   if (!id || !kind || name === undefined || !room || !ROOMS.has(room) || !status || !STATUSES.has(status)) return undefined
   const out: Resident = { id, kind, name, room: room as Room, status: status as ResidentStatus, movedAt: num('movedAt') ?? 0, activity: text('activity') ?? '' }
-  for (const k of ['tool', 'taskType', 'taskStatus', 'waitingTool', 'model'] as const) {
+  for (const k of ['tool', 'taskType', 'taskStatus', 'waitingTool'] as const) {
     const v = text(k)
     if (v !== undefined) out[k] = v
   }
-  for (const k of ['resultAt', 'spawnedAt', 'doneAt', 'idleSince', 'workSince', 'tools', 'errors', 'context', 'box'] as const) {
+  for (const k of ['resultAt', 'spawnedAt', 'doneAt', 'idleSince', 'workSince', 'context', 'box'] as const) {
     const v = num(k)
     if (v !== undefined) out[k] = v
   }
@@ -931,8 +800,7 @@ async function readPeers($: EngineInterface, own: string, now: number): Promise<
     }
     if (!v || now - at > GONE_AFTER || !Array.isArray(v.residents)) continue
     const members = v.residents.flatMap(m => memberOf(m) ?? [])
-    const isBusy = members.some(m => m.status === 'working' || m.status === 'waiting')
-    if (!isBusy && now - (typeof v.activeAt === 'number' ? v.activeAt : 0) > ACTIVE_FOR) continue
+    if (!members.some(isLive) && now - (typeof v.activeAt === 'number' ? v.activeAt : 0) > ACTIVE_FOR) continue
     found.push({
       id: key.slice(PEER.length), name: oneLine(String(v.name || 'session')).slice(0, 40),
       since: Number(v.since) || 0, residents: members,
@@ -954,6 +822,7 @@ async function syncPeers($: EngineInterface): Promise<void> {
   } catch {
     if (now - lastSync > GONE_AFTER) {
       peers = []
+      paintHomes()
       await change($, list => visit(list, [], now))
     }
     return
@@ -961,8 +830,10 @@ async function syncPeers($: EngineInterface): Promise<void> {
   lastSync = now
   await readShipped($, now).catch(() => undefined)
   const names = nameAll([me, ...found])
-  selfName = names.get(me.id) ?? me.name
   peers = found.map(f => ({ id: f.id, name: names.get(f.id) ?? f.name, since: f.since }))
+  paintHomes()
+  // alone, with nobody else's left to see out: nothing to change
+  if (found.length === 0 && !(await read($, residents)).some(c => c.session)) return
   await change($, list => visit(list, found, now))
 }
 
@@ -972,7 +843,7 @@ async function syncPeers($: EngineInterface): Promise<void> {
 // out to the street and is gone at the end of the road.
 function visit(list: Resident[], found: { id: string; residents: Resident[] }[], now: number): Resident[] {
   const here = new Map(list.filter(c => c.session).map(c => [c.id, c]))
-  const ends = errandEnds(list, now)
+  const ends = here.size > 0 ? errandEnds(list, now) : new Map<string, number>()
   const isThere = (c: Resident) => (ends.get(c.id) ?? 0) <= now
   const seen = new Set<string>()
   let queue = 0
@@ -998,8 +869,14 @@ function visit(list: Resident[], found: { id: string; residents: Resident[] }[],
 // Starts sharing once: at the session's start, or at the first change to the
 // household when the start came before the world could answer.
 function startSharing($: EngineInterface): Promise<void> {
-  sharing ??= (async () => {
-    await whoAmI($)
+  if (sharing) return sharing
+  const run = ++runs
+  sharing = (async () => {
+    const me = await whoAmI($)
+    // stopped while it asked
+    if (run !== runs) return
+    self = me
+    for (const beat of beats) beat.cancel()
     beats = [
       $.clock.every(SYNC_EVERY, () => void syncPeers($).catch(() => undefined)),
       $.clock.every(BEAT_EVERY, () => void publish($, true).catch(() => undefined)),
@@ -1018,21 +895,26 @@ async function stopSharing($: EngineInterface): Promise<void> {
   publishing?.cancel()
   publishing = undefined
   sharing = undefined
+  runs++
   const me = self
   self = undefined
+  peers = []
+  paintHomes()
   shared = { at: 0, text: '' }
   if (me) await $.store.delete(PEER + me.id).catch(() => undefined)
 }
 
-// The sessions in the house, this one first, each with its colour; empty
-// while it is alone.
-function households(): Household[] {
-  if (!self || peers.length === 0) return []
+// Each session in the house gets its colour, by when it moved in; this one
+// alone takes none.
+function paintHomes(): void {
+  if (!self || peers.length === 0) {
+    paintSessions([], '')
+    return
+  }
   const me = self
   const all = [{ id: '', since: me.since, key: me.id }, ...peers.map(p => ({ id: p.id, since: p.since, key: p.id }))]
     .sort((a, b) => a.since - b.since || (a.key < b.key ? -1 : 1))
-  const colors = paintSessions(all.map(s => s.id), me.id)
-  return [{ id: '', name: selfName || me.name, color: colors.get('') ?? '#ffd166' }, ...peers.map(p => ({ id: p.id, name: p.name, color: colors.get(p.id) ?? '#ffd166' }))]
+  paintSessions(all.map(s => s.id), me.id)
 }
 
 // ---------- hover cards ----------
@@ -1063,23 +945,32 @@ function agentCard(c: Resident, now: number): string[] {
   const used = usageText(c, now)
   const from = c.session ? `from "${peerName(c.session)}"` : ''
   if (c.kind === 'main') {
-    return ['Host', from, state === 'idle' ? 'waiting for you' : doing, [c.context !== undefined ? `context ${Math.round(c.context)}%` : '', live ? took : ''].filter(Boolean).join(' · ')].filter(Boolean)
+    return ['Host', from, doing, [c.context !== undefined ? `context ${Math.round(c.context)}%` : '', live ? took : '', used ? `${used} tokens this week` : ''].filter(Boolean).join(' · ')].filter(Boolean)
   }
   if (type === 'subagent') return [`${displayName(c)} · ${c.kind}`, c.name, from, doing, [took, used ? `${used} tokens` : ''].filter(Boolean).join(' · ')].filter(Boolean)
   return [`⧗ ${displayName(c)}`, c.activity || c.name, from, [STATE_WORD[state], took].filter(Boolean).join(' · ')].filter(Boolean)
 }
 
+// A docked pane runs floor to ceiling, and the house is wider than it is
+// tall: on the desktop the tall picture stands in the pane's middle, its
+// garden clipped evenly above and below. How much of it fits turns on how
+// tall a pane row is against a column, which the pane does not say; code
+// fonts run from about 2.3 to 2.8 times, and the low end is taken, so a pane
+// too short for the house's own stretch of the picture narrows the picture
+// enough that the house is never cut.
+const ROW_RATIO = 2.3
+// and the high end, for the most of the garden a pane could show
+const TALLEST_ROW = 2.8
+
 // The surface shows each picture as an image, and an image's clock can fall
 // behind the house's: it stops while the window is hidden, and starts over
-// whenever the surface loads the picture again. So every redraw draws both
-// pictures afresh, on time, and the pane is redrawn at least this often, so
-// a picture left behind catches up within a second.
-const REFRESH_MS = 1000
+// whenever the surface loads the picture again. So every redraw draws every
+// picture afresh, on time, and the pane is redrawn at least this often, so
+// a picture left behind catches up within two seconds; no oftener, as each
+// redraw sends every picture again.
+const REFRESH_MS = 2000
 // the redraw's pace while nobody in the house walks
 const QUIET_MS = 4000
-
-// The desktop's last drawing, what it was drawn from and when.
-let lastDesk: { sig: string; at: number; tree: RenderElement } | undefined
 
 // A sprite's reach around the spot it stands on: its body, hat and name tag.
 const REACH = { left: 8, right: 8, up: 15, down: 6 }
@@ -1101,8 +992,9 @@ type Band = { y0: number; y1: number; cells: { c: Resident; x0: number; x1: numb
 // each spot it takes
 function houseBands(list: Resident[], tracks: Track[], now: number, grid: HouseGrid): Band[] {
   const zones: Zone[] = []
+  const byId = new Map(list.map(c => [c.id, c]))
   for (const t of tracks) {
-    const c = list.find(m => m.id === t.id)
+    const c = byId.get(t.id)
     if (!c) continue
     let span: Omit<Zone, 'c'> | undefined
     for (let ms = now; ms <= now + REFRESH_MS + LAG_MS; ms += STEP_MS) {
@@ -1195,7 +1087,7 @@ function houseHoverLayer(ui: Pick<Elements['desktop'], 'Box' | 'Svg'>, bands: Ba
             <Box width={widths[i * 2] ?? '0%'} height="100%" />,
             <Box key={`a-${cell.c.id}`} width={widths[i * 2 + 1] ?? '0%'} height="100%">
               <Box position="absolute" left={isRight ? span + 1 : -(width + 1)} {...(isUpper ? { top: 0 } : { bottom: 0 })} width={width} display="none" hover={{ display: 'flex' }}>
-                <Svg source={cardSvg(lines, colorFor(cell.c), units, 2)} alt={lines.join(' · ')} />
+                <Svg source={cardSvg(lines, colorFor(cell.c), units)} alt={lines.join(' · ')} />
               </Box>
             </Box>,
           ]
@@ -1249,25 +1141,17 @@ function cardOf(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, lines: string[],
   )
 }
 
-// The terminal list's scrollbar, `rows` tall: a track down its right edge
-// and a thumb for the part of the list showing, in the theme's own greys.
-function scrollbar(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, view: NonNullable<typeof listView>, top: number, rows: number): RenderElement {
-  const { Box, Text } = ui
-  const scrolls = rows > 1 && view.total > view.shown
-  const len = scrolls ? Math.max(1, Math.min(rows - 1, Math.round((rows * view.shown) / view.total))) : 0
-  const at = scrolls ? Math.round(((rows - len) * top) / Math.max(1, view.maxTop)) : 0
-  return (
-    <Box key={SCROLLBAR} flexDirection="column" width={1} height={rows}>
-      {Array.from({ length: rows }, (_, y) => {
-        const isThumb = scrolls && y >= at && y < at + len
-        return <Text color={isThumb ? 'inactive' : 'subtle'}>{scrolls ? (isThumb ? '┃' : '│') : ' '}</Text>
-      })}
-    </Box>
-  )
-}
-
-async function openPane($: EngineInterface) {
-  return $.ui.open({ id: PANE, title: 'Vibehaus' })
+// Opens the house. `afresh`, as the person's own asks are: one already open,
+// showing or not, is closed and opened again, since on the desktop a pane
+// opened again while open, or kept across a reload of the plugin, can stay
+// blank; else one already open is left be.
+async function openPane($: EngineInterface, afresh = false): Promise<void> {
+  const panes = await $.ui.panes().catch(() => [])
+  if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
+    if (!afresh) return
+    await $.ui.close({ id: PANE }).catch(() => undefined)
+  }
+  await $.ui.open({ id: PANE, title: 'Vibehaus' })
 }
 
 // ---------- /haus demo: a made-up household going about made-up work ----------
@@ -1305,7 +1189,7 @@ function demoMember(i: number, now: number, room: Room): Resident {
   return {
     id: `demo-${i}`, name: job.name, kind: job.kind, room: roomFor(step.tool), movedAt: now,
     status: 'working', activity: `${step.tool}: ${step.what}`, tool: step.tool, spawnedAt: now, spawnRoom: room,
-    taskType: 'subagent', taskStatus: 'running', isDemo: true, tools: 1, model: 'claude-haiku-4-5', calls: [now],
+    taskType: 'subagent', taskStatus: 'running', isDemo: true, calls: [now],
   }
 }
 
@@ -1329,7 +1213,7 @@ async function demoStep($: EngineInterface): Promise<void> {
   const step = DEMO_STEPS[(demoTick * 7) % DEMO_STEPS.length] as (typeof DEMO_STEPS)[number]
   await move($, who.id, c => ({
     status: 'working', room: roomFor(step.tool), tool: step.tool, activity: `${step.tool}: ${step.what}`,
-    resultAt: now, isOk: demoTick % 9 !== 0, tools: (c.tools ?? 0) + 1, calls: [...(c.calls ?? []), now].slice(-MAX_CALLS),
+    resultAt: now, isOk: demoTick % 9 !== 0, calls: [...(c.calls ?? []), now].slice(-MAX_CALLS),
   }))
 }
 
@@ -1377,15 +1261,16 @@ async function snapshot($: EngineInterface): Promise<void> {
   await $.fs.write('vibehaus-snapshot.svg', source)
 }
 
-// The footer button: opens the house, or closes it when it is showing.
+// The band's ◧ Vibehaus button: opens the house, or closes it when it is
+// showing.
 async function togglePane($: EngineInterface): Promise<void> {
   try {
     const isShowing = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)
     if (isShowing) await $.ui.close({ id: PANE })
-    else await openPane($)
+    else await openPane($, true)
   } catch {
     // a surface that cannot list panes still gets the house opened
-    await openPane($).catch(() => undefined)
+    await openPane($, true).catch(() => undefined)
   }
 }
 
@@ -1425,7 +1310,7 @@ export const register: Register = on => {
         return { text: 'The demo household moved out.' }
       }
       await startDemo($)
-      await openPane($)
+      await openPane($, true)
       return { text: 'A demo household moved in for five minutes. Run /haus demo again to send them home.' }
     }
     if (arg === 'snapshot') {
@@ -1433,42 +1318,43 @@ export const register: Register = on => {
       return { text: 'Saved the house to vibehaus-snapshot.svg in this session\'s folder. It is an animated SVG, so open it in a browser.' }
     }
     if (arg) return { text: 'Usage: /haus, /haus demo or /haus snapshot.' }
-    await openPane($)
+    await openPane($, true)
 
     return { text: 'Vibehaus opened.' }
   })
 
-  // The ◧ Vibehaus button at the right of the prompt footer, beside the mode
-  // labels.
-  on('ui.render', { component: 'SessionMode' }, async ($, e) => {
+  // The band right above the prompt: how much of the plan is used, its
+  // "vibe fatigue", and the ◧ Vibehaus button opening or closing the house.
+  // It gives way to a survey.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    const meters = metersOf(await read($, plan))
 
     return (
-      <Box flexDirection="row" gap={1} alignItems="center">
-        {e.props.modes.length > 0 && <Text dimColor>{e.props.modes.join(' & ')}</Text>}
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+        <Box flexDirection="row" alignItems="center" columnGap={2} flexShrink={1}>
+          <Text dimColor>Vibe fatigue</Text>
+          {meters.map(m => {
+            const filled = m.percent === undefined ? 0 : Math.round((Math.min(100, m.percent) / 100) * BAR)
+            const color = m.percent === undefined ? undefined : meterColor(m)
+            return (
+              <Text>
+                <Text dimColor>{`${m.label.toLowerCase()} `}</Text>
+                <Text color={color}>{'━'.repeat(filled)}</Text>
+                <Text color="#3a3f47">{'━'.repeat(BAR - filled)}</Text>
+                <Text dimColor> {m.percent === undefined ? '--' : `${Math.round(m.percent)}%`}</Text>
+              </Text>
+            )
+          })}
+        </Box>
         <Button key="vibehaus-toggle" label="◧ Vibehaus" plain dimColor onPress={() => void togglePane($)} />
       </Box>
     )
   })
 
-  // In the terminal the pane is never taller than its room, so the wheel and
-  // the scroll keys move the list under the house, which stays put: a wheel
-  // tick NOTCH rows, an arrow a row, a page key the list's window, Home and
-  // End to its ends.
-  on('ui.scroll', async ($, e, next) => {
-    const view = listView
-    if (e.component !== 'Pane' || e.requestId !== PANE || !view) return next(e)
-    const by = e.pointer ? e.by * NOTCH
-      : Math.abs(e.by) >= e.contentRows ? Math.sign(e.by) * Infinity
-        : Math.abs(e.by) >= e.bodyRows ? Math.sign(e.by) * Math.max(1, view.shown - 1)
-          : e.by
-    const top = Math.max(0, Math.min(view.maxTop, (await read($, listScroll)) + by))
-    await update($, listScroll, () => top)
-    return {}
-  })
-
   // Every model request, the lead's and each subagent's, adds its tokens to
-  // that member's hourly and weekly usage.
+  // that member's usage.
   on('turn.step', async function* ($, e, next) {
     const response = yield* next(e)
     void recordUsage($, e.agentId ?? MAIN, tokensOf(response.usage)).catch(() => undefined)
@@ -1504,7 +1390,6 @@ export const register: Register = on => {
     const startedAt = await $.clock.now()
     await move($, id, c => ({
       status: 'working', room: roomFor(tool), activity, tool,
-      tools: (c.tools ?? 0) + 1,
       calls: [...(c.calls ?? []), startedAt].slice(-MAX_CALLS),
     }), stranger)
 
@@ -1517,7 +1402,6 @@ export const register: Register = on => {
       await move($, id, c => ({
         status: c.status === 'waiting' ? 'working' : c.status,
         resultAt: now, isOk, waitingTool: undefined,
-        errors: (c.errors ?? 0) + (isOk ? 0 : 1),
         ...(context !== undefined ? { context } : {}),
       }))
     }
@@ -1547,7 +1431,6 @@ export const register: Register = on => {
           name: `Background ${backgroundKind(tool)}`,
           kind: backgroundKind(tool),
           room: roomFor(tool),
-         
           movedAt: now,
           status: 'working',
           activity: detail(e) || tool,
@@ -1576,7 +1459,7 @@ export const register: Register = on => {
   })
 
   // At the end of every turn the engine hands over its own list of background
-  // work in flight: the list is synced to it, so nothing is missed or stuck.
+  // work in flight: the house is synced to it, so nothing is missed or stuck.
   on('classic.Stop', async ($, e, next) => {
     const asOf = await $.clock.now()
     const answer = await next(e)
@@ -1611,7 +1494,6 @@ export const register: Register = on => {
         name: oneLine(e.description || e.subagentType),
         kind: e.subagentType,
         room: roomForKind(e.subagentType),
-       
         movedAt: now,
         status: 'working',
         activity: 'Starting up',
@@ -1619,8 +1501,6 @@ export const register: Register = on => {
         spawnRoom: lead?.room ?? 'study',
         taskType: 'subagent',
         taskStatus: 'running',
-        tools: 0,
-        ...(spawned.model ? { model: spawned.model } : {}),
         ...(e.background ? { isBackground: true } : {}),
         ...(e.workflow ? { isWorkflow: true } : {}),
         ...(e.isTeammate || spawned.teammateId ? { isTeammate: true } : {}),
@@ -1676,151 +1556,112 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const everyone = ordered(await read($, residents))
-    // a visitor on its way out is drawn walking off, but no longer listed
-    const list = everyone.filter(c => c.leaving === undefined)
     const now = await $.clock.now()
-    // The desktop puts each drawing up whole, in place of the last: a press
-    // whose button is drawn anew between going down and coming up is lost.
-    // The first click on the pane gives it the focus, and so a redraw: one
-    // asked for nothing but that gets the last drawing back, unchanged.
-    const desk = e.surface === 'desktop'
-      ? JSON.stringify([e.props.bodyColumns, e.props.scroll, e.props.placement, everyone, await read($, toggledSessions), await read($, listPage), await read($, plan)])
-      : ''
-    if (lastDesk && lastDesk.sig === desk && now - lastDesk.at < REFRESH_MS) return lastDesk.tree
-    const homes = households()
-    if (homes.length === 0) paintSessions([], '')
-    const working = list.filter(c => c.status === 'working').length
-    const meters = metersOf(await read($, plan))
     const boxes = await yardBoxes($, now)
-    const { layers, tracks: drawnTracks } = housePicture(everyone, boxes, now, meters)
-    const [source = '', ...overlays] = layers
-    const used = meters.map(m => `${m.label.toLowerCase()} ${m.percent === undefined ? 'unknown' : `${Math.round(m.percent)}%`}`).join(', ')
-    const alt = clip(`Vibehaus: ${working} of ${list.length} working. Plan use: ${used}. ${list.map(c => `${displayName(c)}: ${c.activity}`).join('; ')}`, 2000)
-    const rows = taskRows(list, now)
-    const stats: TaskStats = {
-      shippedToday: (await shippedOn($, now)).length,
-      toolsPerMinute: list.reduce((n, c) => n + (c.calls ?? []).filter(t => now - t < 60000).length, 0),
-    }
-    const toggled = await read($, toggledSessions)
-    const items = listItems(rows, stats, homes, toggled, selfName)
-    const acts: Acts = { fold: id => void foldSession($, id), stop: r => void stopTask($, r.id).catch(() => undefined) }
-    const grid = houseGrid()
     // a second on while anyone walks, so the hover zones keep up; more
-    // seldom while all stand still, so fewer presses meet a redraw
-    const isStill = drawnTracks.every(t => {
-      const [a, b] = [spotOf(t, now), spotOf(t, now + QUIET_MS)]
-      const moved = (p?: { x: number; y: number }, q?: { x: number; y: number }) => (p && q ? Math.hypot(p.x - q.x, p.y - q.y) > 0.5 : p !== q)
-      return !moved(a, b) && Array.from({ length: 8 }, (_, i) => spotOf(t, now + ((i + 1) * QUIET_MS) / 9)).every(p => !moved(a, p))
-    })
-    redrawSoon($, isStill ? QUIET_MS : REFRESH_MS)
+    // seldom while all stand still
+    const redrawFor = (tracks: Track[]) => {
+      const isStill = tracks.every(t => {
+        const [a, b] = [spotOf(t, now), spotOf(t, now + QUIET_MS)]
+        const moved = (p?: { x: number; y: number }, q?: { x: number; y: number }) => (p && q ? Math.hypot(p.x - q.x, p.y - q.y) > 0.5 : p !== q)
+        return !moved(a, b) && Array.from({ length: 8 }, (_, i) => spotOf(t, now + ((i + 1) * QUIET_MS) / 9)).every(p => !moved(a, p))
+      })
+      redrawSoon($, isStill ? QUIET_MS : REFRESH_MS)
+    }
 
     if (e.surface === 'terminal') {
-      const { Box, Text, Button, Raster } = $.ui.resolve(e)
-      const ui = { Box, Text, Button }
+      const { Box, Text, Raster } = $.ui.resolve(e)
       const cols = Math.max(16, e.props.bodyColumns)
       const bodyRows = Math.max(16, e.props.scroll.bodyRows)
-      // The house's floor plan as wide as the pane, its agents walking it a
-      // frame at a time; the list in the rest, scrolled by the wheel, the
-      // scroll keys or its scrollbar.
+      const tracks = houseTracks(everyone, now)
+      redrawFor(tracks)
+      // The house's floor plan as big as the pane takes, its agents walking
+      // it a frame at a time.
       const size = planSize(cols, bodyRows)
-      const plan = planOf(size.columns, size.across, size.down, meters, boxes.length, everyone)
-      const walkers = drawnTracks.flatMap(t => {
-        const c = everyone.find(m => m.id === t.id)
+      const plan = planOf(size, boxes.length, everyone)
+      const byId = new Map(everyone.map(c => [c.id, c]))
+      const walkers = tracks.flatMap(t => {
+        const c = byId.get(t.id)
         return c ? [{ c, t }] : []
       })
       played = { plan, walkers }
+      const cells = planCells(plan, walkers, now)
+      shownCells = cells
       playHouse($)
       const inset = Math.max(0, Math.floor((cols - plan.columns) / 2))
-      const listRows = Math.max(0, bodyRows - plan.rows)
-      // what moves on the list, repainted by the plugin a frame at a time;
-      // the list one column short of the pane, for its scrollbar
-      const width = cols - 1
-      const marks: Marks = {
-        host: (r, at) => {
-          const key = `vh-host-${r.id}`
-          return { el: <Raster key={key} columns={width} rows={1} cells={packCells(hostCells(r, at, width))} />, live: { key, paint: t => hostCells(r, t, width) } }
-        },
-        spin: (r, at) => {
-          const key = `vh-spin-${r.id}`
-          return { el: <Raster key={key} columns={1} rows={1} cells={packCells(spinCells(at))} />, live: { key, paint: spinCells } }
-        },
-      }
-      const lines = linesOf(ui, items, now, marks, acts)
-      const maxTop = Math.max(0, lines.length - listRows)
-      const top = Math.min(maxTop, Math.max(0, Math.round(await read($, listScroll))))
-      listView = { maxTop, shown: listRows, total: lines.length }
-      const shown = lines.slice(top, top + listRows)
-      playLive($, shown.flatMap(l => (l.live ? [l.live] : [])))
+      // the plan in the pane's middle, garden in the rows it leaves above
+      // and below
+      const spare = Math.max(0, bodyRows - plan.rows)
+      const above = Math.floor(spare / 2)
+      const below = spare - above
+      const band = (key: string, rows: number, side: 'above' | 'below') => (
+        <Box marginLeft={inset}>
+          <Raster key={key} columns={plan.columns} rows={rows} cells={gardenRaster(plan.columns, rows, side)} />
+        </Box>
+      )
       return (
-        <Box flexDirection="column" width={cols} height={plan.rows + listRows}>
-          <Box flexDirection="row" flexShrink={0} height={plan.rows}>
+        <Box flexDirection="column" width={cols} height={plan.rows + spare}>
+          {above > 0 && band('vh-garden-above', above, 'above')}
+          <Box flexDirection="row" height={plan.rows}>
             <Box marginLeft={inset}>
-              <Raster key={RASTER} columns={plan.columns} rows={plan.rows} cells={packCells(planCells(plan, walkers, now))} />
+              <Raster key={RASTER} columns={plan.columns} rows={plan.rows} cells={packCells(cells)} />
             </Box>
-            {planHoverCells(ui, planBands(plan, walkers, now), now, inset, cols, plan.rows)}
+            {planHoverCells({ Box, Text }, planBands(plan, walkers, now), now, inset, cols, plan.rows)}
           </Box>
-          <Box flexDirection="row" flexShrink={0} height={listRows}>
-            <Box flexDirection="column" flexGrow={1}>{shown.map(l => l.el)}</Box>
-            {scrollbar(ui, listView, top, listRows)}
-          </Box>
+          {below > 0 && band('vh-garden-below', below, 'below')}
         </Box>
       )
     }
+
+    // the picture's description: who, the task, and what each is doing or
+    // how it ended; a visitor on its way out is drawn walking off, but no
+    // longer counted
+    const list = everyone.filter(c => c.leaving === undefined)
+    const meters = metersOf(await read($, plan))
+    const working = list.filter(c => c.status === 'working').length
+    const used = meters.map(m => `${m.label.toLowerCase()} ${m.percent === undefined ? 'unknown' : `${Math.round(m.percent)}%`}`).join(', ')
+    const doing = (c: Resident) => {
+      const isAgent = c.kind !== 'main' && taskTypeOf(c) === 'subagent'
+      const ended = c.status === 'done' && !isAgent && c.kind !== 'main' ? ` (${c.taskStatus ?? 'done'})` : ''
+      return `${displayName(c)}: ${isAgent ? `${c.name} · ` : ''}${c.activity}${ended}`
+    }
+    const alt = clip(`Vibehaus: ${working} of ${list.length} working. Plan use: ${used}. ${list.map(doing).join('; ')}`, 2000)
 
     if (e.surface === 'desktop') {
-      const { Box, Svg, Text, Button } = $.ui.resolve(e)
-      const ui = { Box, Svg, Text, Button }
-      const cols = Math.max(1, e.props.bodyColumns)
-      const bodyRows = e.props.scroll.bodyRows
-      // The house and its bars at the top, the list under them a page at a
-      // time, and the buttons turning the pages at the bottom: the whole a
-      // hair short of the pane, so the pane itself never scrolls.
-      const room = (end: 'low' | 'high') => Math.max(4, Math.floor(bodyRows - 0.1 - CONTROL_ROWS[end] - (cols * grid.h) / (grid.w * ROW_RATIOS[end])))
-      // what moves on the list: pictures that play by themselves
-      const marks: Marks = {
-        host: (r, at) => ({ el: <Svg source={hostSvg(r, at, cols)} alt={`${r.title} · running`} /> }),
-        spin: (_, at) => ({ el: <Svg source={spinSvg(at)} alt="running" /> }),
-      }
-      const lines = linesOf(ui, items, now, marks, acts)
-      const pages = pagesOf(lines, room('high'), room('low'))
-      const index = Math.max(0, Math.min(pages.length - 1, await read($, listPage)))
-      const turn = (by: number) => () => void update($, listPage, p => Math.max(0, Math.min(pages.length - 1, Math.min(p, pages.length - 1) + by)))
-      // the buttons turning the page, when there is more than one
-      const controls = pages.length > 1 && (
-        <Box flexDirection="row" justifyContent="center" columnGap={2} alignItems="center" flexShrink={0}>
-          <Button key="vh-page-back" plain label="◂" onPress={turn(-1)} />
-          <Text dimColor>{index + 1}/{pages.length}</Text>
-          <Button key="vh-page-on" plain label="▸" onPress={turn(1)} />
-        </Box>
-      )
-      const tree = (
-        <Box flexDirection="column" height={bodyRows - 0.1} overflow="hidden">
-          <Box position="relative" flexDirection="column" flexShrink={0}>
-            <Svg source={source} alt={alt} />
-            {overlays.map((layer, i) => (
-              <Box key={`agents-${i}`} position="absolute" top={0} left={0} width="100%" height="100%">
-                <Svg source={layer} alt="The agents in the house" />
+      const { Box, Svg } = $.ui.resolve(e)
+      const { layers, tracks } = housePicture(everyone, boxes, now)
+      redrawFor(tracks)
+      const grid = houseGrid(true)
+      // a pane just opened may not be measured yet
+      const sized = (n: number, or: number) => (Number.isFinite(n) && n >= 1 ? n : or)
+      const cols = sized(e.props.bodyColumns, 80)
+      const bodyRows = sized(e.props.scroll.bodyRows, 40)
+      // The tall picture in the pane's middle, the pane clipping its garden
+      // evenly above and below; narrowed, centred, when the pane is too short
+      // for the house's own stretch of it, to a whole percentage (all a Box
+      // takes). The body takes its height from the tree: neither a percentage
+      // nor a picture laid over it gives it one.
+      const room = (grid.w * (bodyRows - 0.1) * ROW_RATIO) / cols
+      const width = Math.max(1, Math.min(100, Math.floor((room / houseGrid().h) * 100)))
+      return (
+        <Box flexDirection="column" height={bodyRows - 0.1} overflow="hidden" justifyContent="center" alignItems="center">
+          <Box position="relative" flexDirection="column" flexShrink={0} width={`${width}%`}>
+            <Svg source={gardenPicture(now, (grid.w * bodyRows * TALLEST_ROW) / cols)} alt="The garden round the house" />
+            {layers.map((layer, i) => (
+              <Box key={`layer-${i}`} position="absolute" top={0} left={0} width="100%" height="100%">
+                <Svg source={layer} alt={i === 0 ? alt : 'The agents in the house'} />
               </Box>
             ))}
-            {houseHoverLayer(ui, houseBands(everyone, drawnTracks, now, grid), now, grid, cols)}
+            {houseHoverLayer({ Box, Svg }, houseBands(everyone, tracks, now, grid), now, grid, cols)}
           </Box>
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden">{(pages[index] ?? []).map(l => l.el)}</Box>
-          {controls}
         </Box>
       )
-      lastDesk = { sig: desk, at: now, tree }
-      return tree
     }
 
-    // elsewhere, the pictures as one, the agents left off one too big
-    const { Box, Svg } = $.ui.resolve(e)
-    const panel = tasksPanel(rows, stats, now, grid.w, homes, toggled, selfName)
-    const whole = svg(everyone, boxes, now, meters)
-    return (
-      <Box flexDirection="column">
-        <Svg source={whole.length <= 131072 ? whole : source} alt={alt} />
-        <Svg source={panel.source} alt={panel.alt} />
-      </Box>
-    )
+    // elsewhere, the pictures as one, with as many agents as fit, and the
+    // plan bars in the corner, there being no band
+    const { Svg } = $.ui.resolve(e)
+    redrawFor(houseTracks(everyone, now))
+    return <Svg source={svg(everyone, boxes, now, meters, SVG_LIMIT)} alt={alt} />
   })
 }

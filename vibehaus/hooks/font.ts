@@ -106,17 +106,6 @@ const GLYPHS: Record<string, string[]> = {
   '⧗': ['#####', '.###.', '..#..', '..#..', '.#.#.', '#...#', '#####'],
   '♥': ['.....', '.#.#.', '#####', '#####', '.###.', '..#..'],
   '♪': ['..###', '..#.#', '..#..', '..#..', '###..', '###..'],
-  // the tasks list's state marks
-  '○': ['.....', '.###.', '#...#', '#...#', '#...#', '.###.'],
-  '◦': ['.....', '.....', '.###.', '.#.#.', '.###.'],
-  '◷': ['.###.', '#.#.#', '#.#.#', '#.###', '#...#', '#...#', '.###.'],
-  '✓': ['.....', '....#', '....#', '...#.', '#.#..', '.#...'],
-  '✕': ['.....', '#...#', '.#.#.', '..#..', '.#.#.', '#...#'],
-  '■': ['....', '....', '####', '####', '####', '####'],
-  '⊘': ['.....', '.###.', '#..##', '#.#.#', '##..#', '.###.'],
-  // a section of the list, open or folded
-  '▾': ['.....', '.....', '#####', '.###.', '..#..'],
-  '▸': ['...', '#..', '##.', '###', '##.', '#..'],
 }
 GLYPHS[String.fromCharCode(92)] = ['#....', '#....', '.#...', '..#..', '...#.', '....#', '....#']
 
@@ -195,7 +184,7 @@ type Rect = [x: number, y: number, w: number, h: number]
 
 // A bitmap's lit pixels as few rectangles: each run across a row grows down
 // while the rows below light the same span, so strokes cost one rectangle.
-export function rectsOf(rows: string[]): Rect[] {
+function rectsOf(rows: string[]): Rect[] {
   const used = rows.map(row => [...row].map(() => false))
   const lit = (x: number, y: number) => rows[y]?.[x] === '#' && used[y]?.[x] === false
   const out: Rect[] = []
@@ -223,7 +212,7 @@ function rectsOfChar(ch: string): Rect[] {
   return rects
 }
 
-export const pathOf = (rects: Rect[], dx = 0, dy = 0) =>
+const pathOf = (rects: Rect[], dx = 0, dy = 0) =>
   rects.map(([x, y, w, h]) => `M${x + dx} ${y + dy}h${w}v${h}h${-w}z`).join('')
 
 // The outline of `text` in whole font pixels from its top-left corner. Kept,
@@ -244,12 +233,6 @@ function outline(text: string): string {
   return d
 }
 
-// Characters stacked one above another, `step` font pixels apart, as one
-// outline: the reel an odometer digit rolls through.
-export function reel(chars: string[], step: number): string {
-  return chars.map((ch, k) => pathOf(rectsOfChar(ch), 0, k * step)).join('')
-}
-
 // `text` as one path, its top-left corner (the top of its capitals) at
 // (x, y); `anchor` places it by its start, middle or end, as text-anchor would.
 // `cls` names a class the picture's style recolours in the light theme.
@@ -262,4 +245,30 @@ export function pixelText(
   const w = textWidth(text, px)
   const left = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x
   return `<path${cls ? ` class="${cls}"` : ''} transform="translate(${r2(left)} ${r2(y)}) scale(${Math.round(px * 1000) / 1000})" fill="${color}" d="${d}"/>`
+}
+
+// `text` placed as pixelText places it, but as copies of each glyph: the
+// glyph's outline handed once to `define`, by an id of its own, and every
+// use of it a reference; far shorter than an outline apiece once letters
+// repeat, as they do across a card or a householdful of names.
+export function glyphText(
+  text: string, x: number, y: number,
+  { px = 0.5, color, anchor = 'start', cls }: { px?: number; color: string; anchor?: 'start' | 'middle' | 'end'; cls?: string },
+  define: (id: string, d: string) => void,
+): string {
+  let uses = ''
+  let cx = 0
+  for (const ch of normalize(text)) {
+    const rects = rectsOfChar(ch)
+    if (rects.length > 0) {
+      const id = `gl${(ch.codePointAt(0) ?? 63).toString(36)}`
+      define(id, pathOf(rects))
+      uses += `<use href="#${id}"${cx ? ` x="${cx}"` : ''}/>`
+    }
+    cx += widthOf(glyphOf(ch)) + 1
+  }
+  if (!uses) return ''
+  const w = textWidth(text, px)
+  const left = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x
+  return `<g${cls ? ` class="${cls}"` : ''} transform="translate(${r2(left)} ${r2(y)}) scale(${Math.round(px * 1000) / 1000})" fill="${color}">${uses}</g>`
 }

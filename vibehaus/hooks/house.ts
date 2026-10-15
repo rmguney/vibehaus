@@ -17,7 +17,9 @@ export type Dir = 'N' | 'S' | 'E' | 'W'
 export type Cell = { x: number; y: number; w: number; h: number; col: number; row: number }
 // `w` and `h`: the picture's size; `pw` and `ph`: the plan's; `ox`, `oy`:
 // where the plan's corner lands in the picture.
-export type Layout = { w: number; h: number; pw: number; ph: number; ox: number; oy: number; grid: Room[][]; rooms: Record<Room, Cell> }
+// `extra`: in a tall picture, how much more garden lies above the house's
+// own stretch of it and below, in picture units each way.
+export type Layout = { w: number; h: number; pw: number; ph: number; ox: number; oy: number; grid: Room[][]; rooms: Record<Room, Cell>; extra?: number }
 
 // A room's floor is S units each way; walls are T thick.
 const S = 40
@@ -27,8 +29,8 @@ const LOW_WALL = 5
 const PAD = 3
 // room above the back walls for the labels on them
 const HEADROOM = 4
-// room around the house for the garden: either side, above for the trees
-// behind it, and below for the island's dirt edge
+// room around the house in its own stretch of the picture: either side,
+// above for the trees behind it, and below for the yard's far end
 const SIDE = 14
 const TREES = 10
 const BELOW = 14
@@ -48,6 +50,12 @@ export function house(): Layout {
   return { w: pw + ph + 2 * (PAD + SIDE), h: Math.ceil((pw + ph) / 2 + oy + PAD + BELOW), pw, ph, ox, oy, grid: HOUSE, rooms }
 }
 
+// The same house in a picture `by` units taller each way, the garden going
+// on above and below it.
+export function stretch(L: Layout, by: number): Layout {
+  return { ...L, oy: L.oy + by, h: L.h + 2 * by, extra: by }
+}
+
 // A point of the plan at height z, on the picture.
 export function at(L: Layout, x: number, y: number, z = 0): Pt {
   return { x: x - y + L.ox, y: (x + y) / 2 - z + L.oy }
@@ -61,7 +69,7 @@ export const doorX = (c: Cell) => c.x + DOOR
 export const floorBottom = (c: Cell) => c.y + c.h - 3
 
 // The front door, in the workshop's front wall, where the road out to the
-// mailbox starts: its span along the wall, and its middle.
+// street starts: its span along the wall, and its middle.
 export function frontDoor(L: Layout): { x0: number; x1: number; mid: number } {
   const mid = L.rooms.workshop.x + 21
   return { x0: mid - 5, x1: mid + 5, mid }

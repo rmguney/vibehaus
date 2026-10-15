@@ -26,6 +26,19 @@ export function shade(hex: string, f: number): string {
   return '#' + ((c(16) << 16) | (c(8) << 8) | c(0)).toString(16).padStart(6, '0')
 }
 
+// mulberry32: a small seeded generator, so a picture is the same on every
+// redraw.
+export function rng(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
 // A material from its night and day colours; `faces` adds the box shades.
 export function mat(cls: string, night: string, day: string): Mat {
   return { cls, night, day }
@@ -119,21 +132,16 @@ export class Canvas {
     this.raw(`<use href="#${id}" x="${dx}" y="${dy}"${paint}${end}`)
   }
 
-  // Defines a stamp without placing it, and says how far `origin` lies from
-  // the first one's, in whole pixels: for copies placed by hand, as a tree
-  // whose crown sways about its own trunk.
-  // `draw` may hand back an animation for the whole piece, as a sway.
-  define(id: string, origin: Pt, draw: (cv: Canvas) => string | void): { dx: number; dy: number } {
-    let first = this.stamps.get(id)
-    if (!first) {
-      const sub = new Canvas()
-      const anim = draw(sub) ?? ''
-      for (const [k, m] of sub.used) this.used.set(k, m)
-      this.defs.push(`<g id="${id}">${anim}${sub.svg()}</g>`)
-      this.stamps.set(id, origin)
-      first = origin
-    }
-    return { dx: Math.round(origin.x - first.x), dy: Math.round(origin.y - first.y) }
+  // Defines a piece once without placing it, for copies placed by hand, as
+  // a tree whose crown sways about its own trunk. `draw` may hand back an
+  // animation for the whole piece, as a sway.
+  define(id: string, draw: (cv: Canvas) => string | void): void {
+    if (this.stamps.has(id)) return
+    const sub = new Canvas()
+    const anim = draw(sub) ?? ''
+    for (const [k, m] of sub.used) this.used.set(k, m)
+    this.defs.push(`<g id="${id}">${anim}${sub.svg()}</g>`)
+    this.stamps.set(id, { x: 0, y: 0 })
   }
 
   // The pieces stamped, for the picture's defs.
@@ -176,36 +184,6 @@ export class Canvas {
   rect(x: number, y: number, w: number, h: number, m: Mat | string): void {
     if (w <= 0 || h <= 0) return
     this.runs(m, Array.from({ length: h }, (_, i) => [y + i, x, w] as [number, number, number]))
-  }
-
-  // A shape of any outline, as pixel runs ([row, left, width]): split into
-  // stacks of single runs, each overlapping the one above, and each stack
-  // drawn as one outline.
-  region(list: [number, number, number][], m: Mat | string): void {
-    const byRow = new Map<number, [number, number, number][]>()
-    for (const run of list) byRow.set(run[0], [...(byRow.get(run[0]) ?? []), run])
-    const overlaps = (a: [number, number, number], b: [number, number, number]) => a[1] < b[1] + b[2] && b[1] < a[1] + a[2]
-    const stacks: [number, number, number][][] = []
-    let open: [number, number, number][][] = []
-    for (const row of [...byRow.keys()].sort((a, b) => a - b)) {
-      const here = (byRow.get(row) ?? []).sort((a, b) => a[1] - b[1])
-      const next: [number, number, number][][] = []
-      for (const run of here) {
-        const above = open.filter(s => overlaps(s[s.length - 1] as [number, number, number], run))
-        const stack = above.length === 1 ? above[0] : undefined
-        const last = stack?.[stack.length - 1]
-        if (stack && last && last[0] === row - 1 && here.filter(o => overlaps(last, o)).length === 1) {
-          stack.push(run)
-          next.push(stack)
-        } else {
-          const fresh: [number, number, number][] = [run]
-          stacks.push(fresh)
-          next.push(fresh)
-        }
-      }
-      open = next
-    }
-    for (const stack of stacks) this.runs(m, stack)
   }
 
   // Raw markup over everything drawn so far.
@@ -252,16 +230,10 @@ function outline(list: [number, number, number][]): string {
   return `${d}${down !== 0 ? `v${down}` : ''}z`
 }
 
-// The colours of every material a picture used: by night, and by day.
-export function nightStyle(used: Iterable<Mat>): string {
+// The colours of every material a picture used, by night or by day.
+export function styleOf(used: Iterable<Mat>, time: 'night' | 'day'): string {
   let css = ''
-  for (const m of used) css += `.${m.cls}{fill:${m.night}}`
-  return css
-}
-
-export function dayStyle(used: Iterable<Mat>): string {
-  let css = ''
-  for (const m of used) css += `.${m.cls}{fill:${m.day}}`
+  for (const m of used) css += `.${m.cls}{fill:${m[time]}}`
   return css
 }
 

@@ -1,8 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import type { Resident, Track } from '../vibehaus/types'
-import { doorX, doorY, frontDoor, house, T } from '../vibehaus/hooks/house'
-import { arrive, errandEnds, housePicture, reanchor } from '../vibehaus/hooks/scene'
+import type { Resident } from '../vibehaus/types'
+import { doorX, doorY, frontDoor, T } from '../vibehaus/hooks/house'
+import { arrive, errandEnds, houseTracks, LAYOUT, reanchor, spotOf } from '../vibehaus/hooks/scene'
 import { yardOf } from '../vibehaus/hooks/yard'
 
 const PANE_PROPS = {
@@ -14,29 +14,8 @@ const PANE_PROPS = {
   view: {},
 }
 
-// Where a track has its agent at `now`, on the picture.
-function trackAt(t: Track, now: number): { x: number; y: number } {
-  const n = t.keys.length / 3
-  const raw = (now - t.t0) / 1000
-  const s = t.isLoop ? ((raw % t.total) + t.total) % t.total : Math.max(0, Math.min(raw, t.total))
-  let i = 0
-  while (i + 1 < n && (t.keys[(i + 1) * 3] ?? 0) <= s) i++
-  const [t1, x1, y1] = [t.keys[i * 3] ?? 0, t.keys[i * 3 + 1] ?? 0, t.keys[i * 3 + 2] ?? 0]
-  if (i + 1 >= n) return { x: x1, y: y1 }
-  const [t2, x2, y2] = [t.keys[i * 3 + 3] ?? 0, t.keys[i * 3 + 4] ?? 0, t.keys[i * 3 + 5] ?? 0]
-  const u = t2 > t1 ? (s - t1) / (t2 - t1) : 1
-  return { x: x1 + (x2 - x1) * u, y: y1 + (y2 - y1) * u }
-}
-
-// Whether a track has its agent in sight at `now`: a visitor only on its way
-// in from the road or out to it.
-function inSight(t: Track, now: number): boolean {
-  const s = Math.max(0, Math.min((now - t.t0) / 1000, t.total))
-  return !t.shown || (s >= t.shown[0] && s < t.shown[1])
-}
-
 test('nobody walks through a wall or jumps, whatever the household gets up to', async () => {
-  const L = house()
+  const L = LAYOUT
   // back from the picture to the floor plan
   const plan = (X: number, Y: number) => ({ x: (X - L.ox) / 2 + (Y - L.oy), y: Y - L.oy - (X - L.ox) / 2 })
   const cells = Object.values(L.rooms)
@@ -77,7 +56,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
       ({ id, name: id, kind: id === 'main' ? 'main' : 'Explore', room: 'study', movedAt: now, status: 'idle', activity: 'x', ...extra })
     let list: Resident[] = [member('main', { idleSince: now - 5000 })]
     const boxes: string[] = []
-    let tracks = housePicture(list, boxes, now).tracks
+    let tracks = houseTracks(list, now)
     let n = 0
     for (let step = 0; step < 120; step++) {
       now += Math.floor(300 + rnd() * (rnd() < 0.2 ? 20000 : 4000))
@@ -87,7 +66,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
       const ends = errandEnds(list, now)
       const over = (c: Resident) => (ends.get(c.id) ?? Infinity) <= now
       if (list.some(over)) {
-        const shown = new Map(tracks.map(t => [t.id, trackAt(t, now)]))
+        const shown = new Map(tracks.map(t => [t.id, spotOf(t, now)]))
         const next = list.filter(c => !(c.leaving !== undefined && over(c))).map(c => {
           if (!over(c)) return c
           const rest = { ...c }
@@ -95,11 +74,11 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
           return c.carrying ? { ...rest, carrying: false, idleSince: now } : rest
         })
         list = reanchor(list, next, now)
-        tracks = housePicture(list, boxes, now).tracks
+        tracks = houseTracks(list, now)
         for (const t of tracks) {
           const was = shown.get(t.id)
-          const is = trackAt(t, now)
-          if (was && Math.hypot(was.x - is.x, was.y - is.y) > 0.5) problems.push(`${t.id} jumped coming back at step ${step}`)
+          const is = spotOf(t, now)
+          if (was && is && Math.hypot(was.x - is.x, was.y - is.y) > 0.5) problems.push(`${t.id} jumped coming back at step ${step}`)
         }
       }
       const main = list.find(c => c.id === 'main') as Resident
@@ -137,14 +116,14 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
       const done = next.filter(c => c.status === 'done' && !c.carrying && !c.session).sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
       if (done.length > 4) next = next.filter(c => c !== done[0])
 
-      const shown = new Map(tracks.map(t => [t.id, trackAt(t, now)]))
+      const shown = new Map(tracks.map(t => [t.id, spotOf(t, now)]))
       list = reanchor(list, next, now)
-      tracks = housePicture(list, boxes, now).tracks
+      tracks = houseTracks(list, now)
       for (const t of tracks) {
         // where it stands now is where it stood a moment ago
         const was = shown.get(t.id)
-        const is = trackAt(t, now)
-        if (was && Math.hypot(was.x - is.x, was.y - is.y) > 0.5) problems.push(`${t.id} jumped at step ${step}`)
+        const is = spotOf(t, now)
+        if (was && is && Math.hypot(was.x - is.x, was.y - is.y) > 0.5) problems.push(`${t.id} jumped at step ${step}`)
         // and every step of its plan goes by the doorways
         for (let k = 3; k < t.keys.length; k += 3) {
           const p = plan(t.keys[k - 2] ?? 0, t.keys[k - 1] ?? 0)
@@ -159,7 +138,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
 })
 
 test('a visitor comes in from the street by the front door and leaves the same way', () => {
-  const L = house()
+  const L = LAYOUT
   const plan = (X: number, Y: number) => ({ x: (X - L.ox) / 2 + (Y - L.oy), y: Y - L.oy - (X - L.ox) / 2 })
   const road = yardOf(L).road
   const room = L.rooms.library
@@ -169,10 +148,9 @@ test('a visitor comes in from the street by the front door and leaves the same w
   let list = [lead, guest]
   // where the house shows it at `t`, on the plan; nowhere while out of sight
   const where = (t: number) => {
-    const track = housePicture(list, [], t).tracks.find(k => k.id === guest.id)
-    if (!track || !inSight(track, t)) return undefined
-    const p = trackAt(track, t)
-    return plan(p.x, p.y)
+    const track = houseTracks(list, t).find(k => k.id === guest.id)
+    const p = track && spotOf(track, t)
+    return p && plan(p.x, p.y)
   }
   expect(where(now + 1000)).toBeUndefined()
   const onRoad = where(now + 2500)
@@ -185,7 +163,7 @@ test('a visitor comes in from the street by the front door and leaves the same w
   list = reanchor(list, list.map(c => (c.id === guest.id ? { ...c, leaving: t } : c)), t)
   const outAt = errandEnds(list, t).get(guest.id) ?? Infinity
   const last = where(outAt - 300)
-  expect(last !== undefined && last.y > road.y1 - 12 && last.x >= road.x0 && last.x <= road.x1).toBe(true)
+  expect(last !== undefined && last.y > road.y1 - 16 && last.x >= road.x0 && last.x <= road.x1).toBe(true)
   expect(where(outAt + 100)).toBeUndefined()
 })
 

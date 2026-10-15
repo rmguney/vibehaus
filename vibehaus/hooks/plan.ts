@@ -6,7 +6,7 @@
  * front door at the side. Each room is a box with its name over it, its own
  * floor, and the furniture the picture has, drawn flat and plain: desks and
  * their screens, bookshelves, the fireplace, the fridge and stove, the
- * workbench, beds, the TV and the couch. Above it all, the plan's meters.
+ * workbench, beds, the TV and the couch.
  * Each agent is a Clawd as Claude Code draws its own, its role under it in
  * its colour, walking from room to room as it does in the picture; fires,
  * screens and lights flicker frame by frame.
@@ -14,12 +14,12 @@
 import type { Resident, Room, Track } from '../types'
 import { ALL_ROOMS, doorX, doorY, frontDoor, house, ROOM_STYLE } from './house'
 import type { Cell } from './house'
-import type { Meter } from './scene'
-import { bodyColor, colorFor, displayName, spotOf } from './scene'
+import { appFor, bodyColor, colorFor, displayName, LAYOUT, spotOf } from './scene'
+import type { App } from './scene'
 import { yardOf } from './yard'
 
 // a cell colour that is the terminal's own
-export const DEFAULT = 0x01000000
+const DEFAULT = 0x01000000
 const L = house()
 const YARD = yardOf(L)
 const ROAD = YARD.road
@@ -31,8 +31,8 @@ const YARD_DEPTH = ROAD.y1 - L.ph
 
 // the picture's colours by night
 const C = {
-  wall: '#cbb397', glass: '#9cc4ff', grass: '#1d3324', tuft: '#3f6b45', tree: '#2f6b3a', path: '#4d4842', ink: '#a8b0bc',
-  amber: '#f5c47a', track: '#3a3f47', woodDark: '#9a6740', wood: '#b8834f', pine: '#d6b07a', white: '#f4f2ec', stone: '#9ea3aa',
+  wall: '#cbb397', glass: '#9cc4ff', grass: '#1d3324', tuft: '#3f6b45', blade: '#5c8a4c', tree: '#2f6b3a', path: '#4d4842',
+  amber: '#f5c47a', woodDark: '#9a6740', wood: '#b8834f', pine: '#d6b07a', white: '#f4f2ec', stone: '#9ea3aa',
   dark: '#24282e', brick: '#b5644f', brass: '#d8b25a', leaf: '#5fae62', linen: '#fbf9f4', blue: '#6f8fd6', green: '#79b89a',
   armchair: '#5d8f76', couch: '#c77fae', couchBack: '#a8618f', shade: '#f5dca0', red: '#d9584c', parcel: '#c9965a',
   mail: '#d0782e', zz: '#cfd8ff', steam: '#c9cdd3',
@@ -53,12 +53,12 @@ const CLAWD_W = 9
 const LINES = ' ╵╶└╷│┌├╴┘─┴┐┤┬┼'
 
 // A letter a terminal draws one cell wide, which is all a Raster takes: the
-// Latin ones, common punctuation, box drawing, blocks, a few shapes and the
-// spinner's stars; anything else is drawn as a question mark.
-const NARROW = /^[\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2261\u2500-\u25a1\u25ac\u25b2\u25cb\u25cf\u2663\u29d7\u2722\u2736\u273b\u273d]$/
-export const letter = (ch: string) => (NARROW.test(ch) ? ch.codePointAt(0) ?? 63 : 63)
+// Latin ones, common punctuation, box drawing, blocks, a few shapes and a
+// flower; anything else is drawn as a question mark.
+const NARROW = /^[\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2261\u2500-\u25a1\u25ac\u25b2\u25cb\u25cf\u2663\u273d]$/
+const letter = (ch: string) => (NARROW.test(ch) ? ch.codePointAt(0) ?? 63 : 63)
 
-export const hex = (c: string) => parseInt(c.replace('#', '').padEnd(6, '0').slice(0, 6), 16)
+const hex = (c: string) => parseInt(c.replace('#', '').padEnd(6, '0').slice(0, 6), 16)
 // a colour taken toward black, for a floor that what stands on it reads on
 const dim = (c: string, f: number) => {
   const n = hex(c)
@@ -66,58 +66,59 @@ const dim = (c: string, f: number) => {
 }
 const dimmed = (c: string, f: number) => `#${dim(c, f).toString(16).padStart(6, '0')}`
 
+// A cell of lawn: mostly plain, a tuft of grass here and there in one of two
+// greens.
+const TUFTS = ['"', ',', "'", '"']
+function grassAt(k: number, row: number): [string, string] {
+  const n = ((Math.imul(k, 73856093) ^ Math.imul(row, 19349663)) >>> 0) % 19
+  return n < TUFTS.length ? [TUFTS[n] as string, n % 2 ? C.blade : C.tuft] : [' ', C.tuft]
+}
+
 // One agent as the plan draws it: who, and its walk.
 export type Walker = { c: Resident; t: Track }
 
 // Something that changes frame by frame: a cell, and the glyphs and inks it
-// takes turns in, a turn every `ms`.
+// takes turns in, a turn every `ms`; in the plan, as codepoints and inks.
 type Flicker = { at: number; frames: [string, string][]; ms: number }
+type Frames = { at: number; frames: [number, number][]; ms: number }
 
 // A room's box in cells: the row its name is on, its floor's rows under it,
 // its columns between its walls.
 type Box = { head: number; top: number; bottom: number; left: number; right: number }
 
 // The plan for a pane: its size; the cells that stay (walls, floors, the
-// furniture, names, the yard, the meters) and the ones that flicker; which
+// furniture, names, the yard) and the ones that flicker; which
 // cells an agent may stand on; where a point of the floor plan falls; the
 // box around a cell; the beds, for the agents napping in them.
 export type Plan = {
   columns: number; rows: number
-  base: Uint32Array; flickers: Flicker[]; walkable: Uint8Array
+  base: Uint32Array; flickers: Frames[]; walkable: Uint8Array
   cellOf: (x: number, y: number) => [number, number]
   boxOf: (col: number, row: number) => Box
   beds: [number, number][]
 }
 
 // How big the plan is in a pane `columns` wide and `bodyRows` tall: two
-// rooms across with the yard beside them, three down, the meters over them;
-// each room as tall as the pane allows up to about square, the list keeping
-// a fifth of the pane under it, five rows at least. A room is never smaller
-// than a Clawd needs, so a very short pane gives the list less, or none.
-export function planSize(columns: number, bodyRows: number): { columns: number; across: number; down: number; rows: number } {
+// rooms across with the yard beside them, three down; each room as tall as
+// the pane allows up to about square, and never smaller than a Clawd needs.
+type PlanSize = { columns: number; across: number; down: number; rows: number }
+
+export function planSize(columns: number, bodyRows: number): PlanSize {
   const yard = Math.max(6, Math.min(18, Math.round(columns * 0.2)))
   const across = Math.max(CLAWD_W + 2, Math.floor((columns - yard - 1) / 2))
-  const free = bodyRows - Math.max(5, Math.ceil(bodyRows / 5)) - 1
-  const down = Math.max(5, Math.min(Math.round(across / 1.8), Math.floor((free - 1) / 3)))
-  return { columns: 2 * across + 1 + yard, across, down, rows: 3 * down + 2 }
+  const down = Math.max(5, Math.min(Math.round(across / 1.8), Math.floor((bodyRows - 1) / 3)))
+  return { columns: 2 * across + 1 + yard, across, down, rows: 3 * down + 1 }
 }
 
-// What a desk's screen shows by the tool at it: code, a terminal, the web,
-// files, or notes.
-function screenOf(tool: string | undefined): string {
-  if (!tool) return C.dark
-  if (/^(Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)) return '#5ad0ff'
-  if (/^(Bash|PowerShell|Monitor|BashOutput)$/.test(tool)) return '#4cf08c'
-  if (/^(WebFetch|WebSearch)$/.test(tool) || tool.startsWith('mcp__')) return '#52d2f5'
-  if (/^(Read|Grep|Glob|LSP)$/.test(tool)) return '#e6c35c'
-  return '#f4f1e8'
-}
+// What a desk's screen shows by the tool at it, as the picture's does: code,
+// a terminal, the web, files, or notes.
+const SCREENS: Record<App, string> = { code: '#5ad0ff', diff: '#5ad0ff', term: '#4cf08c', web: '#52d2f5', files: '#e6c35c', notes: '#f4f1e8' }
+const screenOf = (tool: string | undefined) => (tool ? SCREENS[appFor(tool)] : C.dark)
 
-// The plan `columns` wide, its rooms `across` cells wide and `down` tall,
-// walls included.
-export function planOf(columns: number, across: number, down: number, meters: Meter[], boxes: number, residents: Resident[]): Plan {
-  const top = 1
-  const rows = top + 3 * down + 1
+// The plan at its size: its rooms `across` cells wide and `down` tall, walls
+// included.
+export function planOf(size: PlanSize, boxes: number, residents: Resident[]): Plan {
+  const { columns, across, down, rows } = size
   const houseRight = 2 * across
   const yardCols = columns - houseRight - 1
   const base = new Uint32Array(columns * rows * 3)
@@ -134,7 +135,11 @@ export function planOf(columns: number, across: number, down: number, meters: Me
     if (paper !== undefined) base[i + 2] = typeof paper === 'number' ? paper : hex(paper)
   }
   const write = (k: number, r: number, text: string, ink: string) => [...text].forEach((ch, i) => set(k + i, r, ch, ink))
-  for (let i = 0; i < base.length; i += 3) base.set([0x20, DEFAULT, DEFAULT], i)
+  for (let i = 0; i < base.length; i += 3) {
+    base[i] = 0x20
+    base[i + 1] = DEFAULT
+    base[i + 2] = DEFAULT
+  }
 
   // The turned plan's units to cells, the walls on whole cells: across, the
   // house's walls at the edges and the middle and the yard past it; down,
@@ -142,16 +147,18 @@ export function planOf(columns: number, across: number, down: number, meters: Me
   const colOf = (X: number) => (X <= ACROSS
     ? Math.max(0, Math.min(houseRight, Math.round(((X - 1) / (ACROSS - 2)) * houseRight)))
     : houseRight + Math.min(yardCols, Math.ceil(((X - ACROSS) / YARD_DEPTH) * yardCols)))
-  const wallRow = (Y: number) => top + Math.max(0, Math.min(3 * down, Math.round(((Y - 1) / (DOWN - 2)) * 3 * down)))
+  const wallRow = (Y: number) => Math.max(0, Math.min(3 * down, Math.round(((Y - 1) / (DOWN - 2)) * 3 * down)))
   const rooms = Object.values(L.rooms)
   const boxOfRoom = (c: Cell): Box => {
     const head = wallRow(c.x - 1) + 1
     return { head, top: head + 1, bottom: wallRow(c.x + c.w + 1) - 1, left: colOf(c.y - 1), right: colOf(c.y + c.h + 1) }
   }
+  const roomBoxes = rooms.map(boxOfRoom)
   const rowOf = (X: number, Y: number) => {
-    const c = X <= ACROSS ? rooms.find(r => Y >= r.x && Y <= r.x + r.w) : undefined
-    if (!c) return wallRow(Y)
-    const b = boxOfRoom(c)
+    const i = X <= ACROSS ? rooms.findIndex(r => Y >= r.x && Y <= r.x + r.w) : -1
+    const c = rooms[i]
+    const b = roomBoxes[i]
+    if (!c || !b) return wallRow(Y)
     return Math.min(b.bottom, b.top + Math.floor(((Y - c.x) / c.w) * (b.bottom - b.top + 1)))
   }
   const cellOf = (x: number, y: number): [number, number] => [colOf(y), rowOf(y, x)]
@@ -278,8 +285,8 @@ export function planOf(columns: number, across: number, down: number, meters: Me
       }
     }
   }
-  const walls = [top, top + down, top + 2 * down, top + 3 * down]
-  for (const k of [0, across, houseRight]) line(k, top, k, top + 3 * down)
+  const walls = [0, down, 2 * down, 3 * down]
+  for (const k of [0, across, houseRight]) line(k, 0, k, 3 * down)
   for (const r of walls) line(0, r, houseRight, r)
   const gap = (k0: number, r0: number, k1: number, r1: number) => {
     for (let r = r0; r <= r1; r++) {
@@ -304,8 +311,8 @@ export function planOf(columns: number, across: number, down: number, meters: Me
   for (const c of rooms) {
     const b = boxOfRoom(c)
     if (c.y < L.ph / 2) for (let r = b.top + 1; r < b.bottom; r++) glass.add(at(0, r))
-    if (c.x < 10) for (let k = b.left + 3; k < b.right - 3; k++) glass.add(at(k, top))
-    if (c.x > L.pw - 50) for (let k = b.left + 3; k < b.right - 3; k++) glass.add(at(k, top + 3 * down))
+    if (c.x < 10) for (let k = b.left + 3; k < b.right - 3; k++) glass.add(at(k, 0))
+    if (c.x > L.pw - 50) for (let k = b.left + 3; k < b.right - 3; k++) glass.add(at(k, 3 * down))
   }
   for (let r = 0; r < rows; r++) {
     for (let k = 0; k < columns; k++) {
@@ -323,11 +330,11 @@ export function planOf(columns: number, across: number, down: number, meters: Me
   // the road from the door to the street, the day's boxes stacked by it, the
   // mailbox at its end.
   const [roadTop, roadBottom] = [cellOf(ROAD.x0 + 1, L.ph + 1)[1], cellOf(ROAD.x1 - 1, L.ph + 1)[1]]
-  for (let r = top; r < rows; r++) {
+  for (let r = 0; r < rows; r++) {
     for (let k = houseRight + 1; k < columns; k++) {
       const isRoad = r >= roadTop && r <= roadBottom
-      const tuft = !isRoad && (k * 7 + r * 13) % 11 === 0
-      set(k, r, tuft ? '"' : ' ', C.tuft, isRoad ? C.path : C.grass)
+      const [ch, ink] = isRoad ? [' ', C.tuft] : grassAt(k, r)
+      set(k, r, ch, ink, isRoad ? C.path : C.grass)
       walkable[at(k, r)] = 1
     }
   }
@@ -336,31 +343,17 @@ export function planOf(columns: number, across: number, down: number, meters: Me
     if (r < roadTop - 1 || r > roadBottom + 1) set(k, r, '♣', C.tree)
   }
   const stack = `${'■'.repeat(Math.min(3, Math.max(0, boxes)))} ${boxes}`
-  write(houseRight + 2, Math.max(top, roadTop - 2), stack, C.parcel)
-  set(columns - 2, Math.max(top, roadTop - 1), '▐', C.mail)
+  write(houseRight + 2, roadTop - 2, stack, C.parcel)
+  set(columns - 2, roadTop - 1, '▐', C.mail)
 
-  // the meters along the top: a label, a bar, how much is used
-  let mk = 0
-  for (const m of meters) {
-    const p = m.percent
-    const filled = p === undefined ? 0 : Math.round((Math.min(100, p) / 100) * 6)
-    write(mk, 0, `${m.label} `, m.color)
-    mk += m.label.length + 1
-    for (let s = 0; s < 6; s++) set(mk + s, 0, '━', s < filled ? m.color : C.track)
-    mk += 6
-    const used = ` ${p === undefined ? '--' : `${Math.round(p)}%`}  `
-    write(mk, 0, used, C.ink)
-    mk += used.length
-  }
-
-  const boxOf = (k: number, r: number): Box => {
-    const c = rooms.find(c => {
-      const b = boxOfRoom(c)
-      return k > b.left && k < b.right && r >= b.head && r <= b.bottom
-    })
-    return c ? boxOfRoom(c) : { head: top, top: top + 1, bottom: rows - 1, left: houseRight, right: columns }
-  }
-  return { columns, rows, base, flickers, walkable, cellOf, boxOf, beds }
+  // the room a cell is in, or for a doorway in a wall either room it opens
+  // into; past the house, the yard
+  const yard: Box = { head: 0, top: 1, bottom: rows - 1, left: houseRight, right: columns }
+  const boxOf = (k: number, r: number): Box => (k >= houseRight ? yard
+    : roomBoxes.find(b => k > b.left && k < b.right && r >= b.head && r <= b.bottom) ??
+      roomBoxes.find(b => k >= b.left && k <= b.right && r >= b.head - 1 && r <= b.bottom + 1) ?? yard)
+  const frames = flickers.map(f => ({ at: f.at, ms: f.ms, frames: f.frames.map(([ch, ink]): [number, number] => [letter(ch), hex(ink)]) }))
+  return { columns, rows, base, flickers: frames, walkable, cellOf, boxOf, beds }
 }
 
 // Where a walker stands in the plan at `now`, on a cell it may stand on;
@@ -369,7 +362,8 @@ export function cellAt(plan: Plan, w: Walker, now: number): [number, number] | u
   const p = spotOf(w.t, now)
   if (!p) return undefined
   // the picture's point back on the floor plan
-  const [k, r] = plan.cellOf((p.x - L.ox) / 2 + (p.y - L.oy), p.y - L.oy - (p.x - L.ox) / 2)
+  const { ox, oy } = LAYOUT
+  const [k, r] = plan.cellOf((p.x - ox) / 2 + (p.y - oy), p.y - oy - (p.x - ox) / 2)
   const ok = (dk: number, dr: number) => plan.walkable[(r + dr) * plan.columns + k + dk] === 1
   const near = [[0, 0], [1, 0], [-1, 0], [0, -1], [0, 1], [1, 1], [-1, -1], [1, -1], [-1, 1]].find(([dk, dr]) => ok(dk ?? 0, dr ?? 0))
   return near ? [k + (near[0] ?? 0), r + (near[1] ?? 0)] : [k, r]
@@ -394,14 +388,94 @@ export function reachOf(plan: Plan, w: Walker, cell: [number, number]): [number,
   return [Math.min(s.left, mid - Math.floor(name / 2)), Math.min(s.feet - 2, row), Math.max(s.left + CLAWD_W, mid - Math.floor(name / 2) + name), Math.max(s.feet, row) + 1]
 }
 
+// The garden above or below the plan, in the rows a taller pane leaves: the
+// lawn the yard's is, copses of autumn trees or pines with their leaves
+// fallen round them and a tree on its own here and there, flowers in twos
+// and threes, more leaves blown about, a pond where there is room and
+// smaller ones; `columns` by `rows`, the same for the same size.
+const AUTUMN = ['#e2702a', '#cf3a2a', '#e8b23a', '#f0663e']
+const FLOWERS = ['#e48aa6', '#b89ae6', '#f2cf5c', '#f4f2ec']
+
+const gardens = new Map<string, string>()
+
+// The garden rows as a Raster takes them, packed once for each size.
+export function gardenRaster(columns: number, rows: number, side: 'above' | 'below'): string {
+  const key = `${columns}x${rows}:${side}`
+  const known = gardens.get(key)
+  if (known !== undefined) return known
+  if (gardens.size > 16) gardens.clear()
+  const packed = packCells(gardenCells(columns, rows, side))
+  gardens.set(key, packed)
+  return packed
+}
+
+function gardenCells(columns: number, rows: number, side: 'above' | 'below'): Uint32Array {
+  const cells = new Uint32Array(columns * rows * 3)
+  let seed = (columns * 131 + rows * 7 + (side === 'above' ? 0 : 977)) >>> 0
+  const r = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 4294967296
+  const pick = <T,>(list: T[]) => list[Math.floor(r() * list.length)] as T
+  const taken = new Set<number>()
+  const set = (k: number, row: number, ch: string, ink: string, bg = C.grass) => {
+    if (k < 0 || k >= columns || row < 0 || row >= rows || taken.has(row * columns + k)) return false
+    cells.set([letter(ch), hex(ink), hex(bg)], (row * columns + k) * 3)
+    return true
+  }
+  for (let row = 0; row < rows; row++) {
+    for (let k = 0; k < columns; k++) {
+      const [ch, ink] = grassAt(k, side === 'above' ? -1 - row : 1000 + row)
+      set(k, row, ch, ink)
+    }
+  }
+  const area = columns * rows
+  // a pond `pw` wide and `ph` tall, its far corners off
+  const pond = (pw: number, ph: number) => {
+    const pk = 1 + Math.floor(r() * Math.max(1, columns - pw - 2))
+    const pr = Math.floor(r() * Math.max(1, rows - ph + 1))
+    for (let dr = 0; dr < ph; dr++) {
+      for (let dk = dr === ph - 1 && ph > 1 ? 1 : 0; dk < pw - (dr === ph - 1 && ph > 1 ? 1 : 0); dk++) {
+        if (set(pk + dk, pr + dr, (pk + dk + pr) % 3 === 0 ? '~' : ' ', C.glass, '#16202e')) taken.add((pr + dr) * columns + pk + dk)
+      }
+    }
+  }
+  if (rows >= 4 && columns >= 16) for (let n = Math.max(1, Math.round(area / 1200)); n > 0; n--) pond(6 + Math.floor(r() * 4), 2)
+  for (let n = Math.round(area / 400); n > 0; n--) pond(3 + Math.floor(r() * 3), 1)
+  // a tree, and its leaves round it
+  const plant = (k: number, row: number, isPine: boolean, ink: string) => {
+    if (!set(k, row, isPine ? '▲' : '♣', ink)) return
+    taken.add(row * columns + k)
+    if (!isPine) for (let m = Math.floor(r() * 2); m > 0; m--) set(k + pick([-2, -1, 1, 2]), row + pick([0, 0, 1]), pick(['·', ',']), ink)
+  }
+  // copses of two to four, each of pines or of one autumn colour
+  for (let n = Math.round(area / 90); n > 0; n--) {
+    const [k, row] = [Math.floor(r() * columns), Math.floor(r() * rows)]
+    const isPine = r() < 0.3
+    const ink = isPine ? C.tree : pick(AUTUMN)
+    for (let m = 2 + Math.floor(r() * 3); m > 0; m--) plant(k + Math.round((r() - 0.5) * 7), row + Math.round((r() - 0.5) * 3), isPine, ink)
+  }
+  for (let n = Math.round(area / 115); n > 0; n--) {
+    const isPine = r() < 0.3
+    plant(Math.floor(r() * columns), Math.floor(r() * rows), isPine, isPine ? C.tree : pick(AUTUMN))
+  }
+  // the flowers, in twos and threes
+  for (let n = Math.round(area / 40); n > 0; n--) {
+    const k = Math.floor(r() * columns)
+    const row = Math.floor(r() * rows)
+    const ink = pick(FLOWERS)
+    for (let m = 2 + Math.floor(r() * 2), dk = 0; m > 0; m--, dk += 1 + Math.floor(r() * 2)) set(k + dk, row + (m % 2), pick(['*', '✽', '·']), ink)
+  }
+  // leaves blown about the lawn
+  for (let n = Math.round(area / 34); n > 0; n--) set(Math.floor(r() * columns), Math.floor(r() * rows), pick(['·', ',', '`']), pick(AUTUMN))
+  return cells
+}
+
 // The plan at `now`, as cells: codepoint, ink and paper each, row by row.
 export function planCells(plan: Plan, walkers: Walker[], now: number): Uint32Array {
   const out = plan.base.slice()
   const { columns } = plan
   for (const f of plan.flickers) {
-    const [ch, ink] = f.frames[Math.floor(now / f.ms) % f.frames.length] ?? [' ', '#000000']
-    out[f.at * 3] = letter(ch)
-    out[f.at * 3 + 1] = hex(ink)
+    const [ch, ink] = f.frames[Math.floor(now / f.ms) % f.frames.length] ?? [0x20, 0]
+    out[f.at * 3] = ch
+    out[f.at * 3 + 1] = ink
   }
   const taken = new Uint8Array(columns * plan.rows)
   const put = (k: number, r: number, ch: string, ink: string, isWord = false) => {
@@ -417,8 +491,8 @@ export function planCells(plan: Plan, walkers: Walker[], now: number): Uint32Arr
     .map(w => ({ w, cell: cellAt(plan, w, now), before: cellAt(plan, w, now - 250) }))
     .filter((p): p is typeof p & { cell: [number, number] } => p.cell !== undefined)
     .sort((a, b) => a.cell[1] - b.cell[1])
-  for (const { w, cell, before } of placed) {
-    const s = spriteAt(plan, cell)
+    .map(p => ({ ...p, s: spriteAt(plan, p.cell) }))
+  for (const { w, cell, before, s } of placed) {
     const isWalking = before !== undefined && (before[0] !== cell[0] || before[1] !== cell[1])
     const body = w.c.status === 'waiting' ? C.amber : bodyColor(w.c)
     const lines = [CLAWD[0] ?? '', CLAWD[1] ?? '', isWalking && Math.floor(now / 250) % 2 ? STEPPING : CLAWD[2] ?? '']
@@ -430,8 +504,7 @@ export function planCells(plan: Plan, walkers: Walker[], now: number): Uint32Arr
     if (w.c.status === 'waiting' && Math.floor(now / 500) % 2) put(s.left + CLAWD_W - 1, s.feet - 2, '!', C.amber, true)
   }
   // each name under its Clawd, centred, in its colour
-  for (const { w, cell } of placed) {
-    const s = spriteAt(plan, cell)
+  for (const { w, s } of placed) {
     if (s.name < 0) continue
     const name = [...displayName(w.c)]
     const b = plan.boxOf(s.left + 4, s.feet)
