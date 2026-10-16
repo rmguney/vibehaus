@@ -1,16 +1,18 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register, RenderElement } from 'claude-code'
+import type { Elements, EngineInterface, Register, RenderElement, SessionRateLimit } from 'claude-code'
 
 import type { Resident, ResidentStatus, PlanUse, Room, Track } from '../types'
 import { cardSvg } from './cards'
 import { ALL_ROOMS } from './house'
-import { cellAt, gardenRaster, packCells, planCells, planOf, planSize, reachOf } from './plan'
+import { cellAt, gardenRaster, packCells, planCells, planOf, planSize, RASTER_ROWS, reachOf } from './plan'
 import type { Plan, Walker } from './plan'
 import type { HouseGrid, Meter } from './scene'
 import {
-  arrive, clip, colorFor, displayName, errandEnds, gardenPicture, houseGrid, housePicture, houseTracks, meterColor, paintSessions, reanchor,
-  spotOf, svg, SVG_LIMIT, taskTypeOf,
+  clip, colorFor, displayName, errandEnds, gardenPicture, houseGrid, housePicture, houseTracks, meterColor, onePicture, own, paintSessions,
+  reanchor, spotOf, svg, SVG_LIMIT, taskTypeOf,
 } from './scene'
+import { visit } from './visitors'
+import type { Household } from './visitors'
 
 const PANE = 'vibehaus'
 const MAIN = 'main'
@@ -20,8 +22,8 @@ const MAX_CALLS = 8
 
 const residents = atom({ plugin: 'vibehaus', key: 'residents' } as const, [])
 const plan = atom({ plugin: 'vibehaus', key: 'plan' } as const, {})
-// The next redraw, `ms` on: the pictures catch up, and the hover zones move
-// on with the sprites.
+const minute = atom({ plugin: 'vibehaus', key: 'minute' } as const, 0)
+// The pending redraw, so pictures and hover zones catch up.
 let nextDraw: { cancel: () => void } | undefined
 
 function redrawSoon($: EngineInterface, ms: number): void {
@@ -32,7 +34,7 @@ function redrawSoon($: EngineInterface, ms: number): void {
       try {
         $.ui.invalidate('ui.render')
       } catch {
-        // the pane, or this load of the plugin, is gone
+        // the pane or this plugin load is gone
       }
     })
   } catch {
@@ -40,12 +42,10 @@ function redrawSoon($: EngineInterface, ms: number): void {
   }
 }
 
-// The house in the terminal, its floor plan played by the plugin a frame at
-// a time into a Raster (see plan.ts): the plan and its walkers as last
-// drawn, the cells last shown, and the timer painting its frames while it is
-// shown. A frame the same as the last is not sent.
+// The terminal house, played into a Raster frame by frame (see plan.ts); repeat frames are skipped.
 const RASTER = 'vh-house'
 const FRAME_MS = 200
+const INLINE_ROWS = 22
 let played: { plan: Plan; walkers: Walker[] } | undefined
 let shownCells: Uint32Array | undefined
 let frames: { cancel: () => void } | undefined
@@ -58,7 +58,7 @@ function playHouse($: EngineInterface): void {
   try {
     frames = $.clock.every(FRAME_MS, () => void paintFrame($))
   } catch {
-    // no timer: the house moves on with each redraw instead
+    // no timer: the house moves with each redraw instead
   }
 }
 
@@ -69,9 +69,11 @@ async function paintFrame($: EngineInterface): Promise<void> {
   try {
     const now = await $.clock.now()
     const cells = planCells(house.plan, house.walkers, now)
-    if (sameCells(cells, shownCells)) return
+    if (played !== house || sameCells(cells, shownCells)) return
     const done = await $.ui.blit({ requestId: PANE, key: RASTER, cells: packCells(cells) })
-    // not shown, or resized: the next redraw starts it again
+    // a redraw replaced the plan meanwhile
+    if (played !== house) return
+    // not shown or resized: the next redraw restarts it
     if (done.deny) stopHouse()
     else shownCells = cells
   } catch {
@@ -88,16 +90,10 @@ function stopHouse(): void {
   shownCells = undefined
 }
 
-// Who a permission prompt is for: the agent it names, else the one at work
-// with the tool it names ("Claude needs your permission to use Bash") that
-// reached for it last, else the lead.
+// A permission prompt's asker waits: the agent it names (any agent asking is named), else the lead.
 async function askFor($: EngineInterface, agentId: string | undefined, message: string): Promise<void> {
   const tool = /permission to use ([^\s.,!]+)/i.exec(message)?.[1]
-  const lastCall = (c: Resident) => c.calls?.[c.calls.length - 1] ?? 0
-  const asking = agentId ?? (await read($, residents))
-    .filter(c => !c.session && c.status === 'working' && (tool === undefined || c.tool === tool))
-    .sort((a, b) => lastCall(b) - lastCall(a))[0]?.id ?? MAIN
-  await move($, asking, c => (c.status === 'working' ? { status: 'waiting', waitingTool: tool ?? c.tool } : {}))
+  await move($, agentId ?? MAIN, c => (c.status === 'working' ? { status: 'waiting', waitingTool: tool ?? c.tool } : {}))
 }
 
 const LEAD: Resident = {
@@ -105,6 +101,7 @@ const LEAD: Resident = {
   movedAt: 0, status: 'idle', activity: 'Waiting for you',
 }
 
+// BashOutput, KillShell, MultiEdit and NotebookRead are older builds' tools, kept for them.
 function roomFor(tool: string): Room {
   if (/^(Read|Grep|Glob|LSP|NotebookRead|ListMcpResourcesTool|ReadMcpResourceTool)$/.test(tool)) return 'library'
   if (/^(Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)) return 'workshop'
@@ -117,8 +114,7 @@ function roomForKind(kind: string): Room {
   return kind === 'Explore' ? 'library' : 'study'
 }
 
-// One line, short enough for a label: a heredoc must not end up in the
-// state or a picture's alt text.
+// One short line, so no heredoc reaches the state or alt text.
 function oneLine(text: string): string {
   return clip(text.replace(/\s+/g, ' ').trim(), MAX_TEXT)
 }
@@ -143,14 +139,13 @@ function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined
 }
 
-// Which field of a tool's result names the task it left in the background.
-// Only these tools start background work; the todo tools' `taskId` is a todo.
+// Fields naming a tool's background task; the todo tools' `taskId` is a todo.
 const BACKGROUND_FIELD: Record<string, string> = {
   Bash: 'backgroundTaskId', PowerShell: 'backgroundTaskId', Monitor: 'taskId', Workflow: 'taskId',
 }
 
 function backgroundId(tool: string, result: unknown): string | undefined {
-  const field = BACKGROUND_FIELD[tool]
+  const field = own(BACKGROUND_FIELD, tool)
   if (!field || typeof result !== 'object' || result === null) return undefined
   return str((result as Record<string, unknown>)[field])
 }
@@ -161,13 +156,10 @@ function backgroundKind(tool: string): string {
 
 const isLive = (c: Resident) => c.status === 'working' || c.status === 'waiting'
 
-// Finished members dropped from the list: the engine's background list may
-// still name one briefly, and it must not come back as a phantom.
+// Dropped finished members, so a brief late listing does not bring one back.
 const forgotten = new Set<string>()
 
-// Keeps the last few finished members, dropping the oldest first; nobody is
-// dropped while still carrying its box out. The demo household keeps its own few,
-// so it never pushes real work off the list.
+// Keeps a few finished members, none still carrying a box; the demo's few never push out real work.
 function settle(list: Resident[]): Resident[] {
   const byAge = (a: Resident, b: Resident) => (a.doneAt ?? 0) - (b.doneAt ?? 0)
   const demoDone = list.filter(c => c.status === 'done' && c.isDemo && !c.carrying && !c.session).sort(byAge)
@@ -189,8 +181,7 @@ function without<K extends keyof Resident>(c: Resident, key: K): Resident {
   return copy
 }
 
-// Desks stick: a member keeps its desk while it works in that room, and a
-// newcomer takes the lowest free one, so nobody slides over when others leave.
+// Desks stick, so nobody slides over when others leave.
 function assignSeats(prev: Resident[], wanted: Resident[]): Resident[] {
   const was = new Map(prev.map(c => [c.id, c]))
   const taken = new Map<Room, Set<number>>()
@@ -215,9 +206,7 @@ function assignSeats(prev: Resident[], wanted: Resident[]): Resident[] {
   })
 }
 
-// Every change to the household goes through here, so anyone whose plan changes is
-// first pinned to where the house shows it now, and walks on from there.
-// A write that changes nothing is skipped, so it redraws nothing either.
+// All household changes: changed plans start where shown now; unchanged writes are skipped.
 async function change($: EngineInterface, fn: (list: Resident[]) => Resident[]): Promise<void> {
   void startSharing($).catch(() => undefined)
   const now = await $.clock.now()
@@ -227,15 +216,17 @@ async function change($: EngineInterface, fn: (list: Resident[]) => Resident[]):
     return reanchor(base, seated, now)
   }
   const before = await read($, residents)
-  if (JSON.stringify(apply(before)) === JSON.stringify(before)) return
-  await update($, residents, apply)
+  const after = apply(before)
+  if (JSON.stringify(after) === JSON.stringify(before)) return
+  // as worked out, unless another change landed first
+  await update($, residents, list => (list === before ? after : apply(list)))
   void publish($).catch(() => undefined)
 }
 
 type Patch = Partial<Resident> | ((c: Resident) => Partial<Resident>)
 
 async function move($: EngineInterface, id: string, patch: Patch, fallback?: Resident): Promise<void> {
-  // nothing to write for someone who is not in the house (the lead always is)
+  // not in the house: nothing to write (the lead always is)
   if (!fallback && id !== MAIN && !(await read($, residents)).some(c => c.id === id)) return
   const now = await $.clock.now()
   await change($, base => {
@@ -262,8 +253,7 @@ async function join($: EngineInterface, member: Resident): Promise<void> {
   await change($, base => settle([...base.filter(c => c.id !== member.id), member]))
 }
 
-// Store writes that read first go one at a time, so two hooks of this
-// session never both count from the same old value.
+// Read-then-write store jobs run one at a time, so none counts from a stale value.
 let storeQueue: Promise<unknown> = Promise.resolve()
 
 function serial<T>(job: () => Promise<T>): Promise<T> {
@@ -272,10 +262,7 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
   return run
 }
 
-// The day's shipping. Each session keeps when it shipped each box under a
-// key of its own, so sessions side by side never write over one another; the
-// yard stacks everyone's boxes in the order they went, so each box keeps its
-// place and its tape whoever ships next.
+// Today's shipping, a key per session; boxes stack by time so each keeps its place and tape.
 type Shipment = { at: number; session: string }
 let shippedToday: { day: string; boxes: Shipment[] } = { day: '', boxes: [] }
 
@@ -284,17 +271,20 @@ function dayOf(now: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
+// This session's id, before sharing starts too.
+const ownId = async ($: EngineInterface) => self?.id ?? await $.session.id().catch(() => 'local')
+
 async function readShipped($: EngineInterface, now: number): Promise<void> {
   const day = dayOf(now)
   const prefix = `shipped:${day}:`
-  const own = self?.id ?? 'local'
+  const own = await ownId($)
   const all: { at: number; id: string }[] = []
   for (const key of await $.store.keys()) {
     if (!key.startsWith(prefix)) continue
     const id = key.slice(prefix.length)
     for (const at of numbers(await $.store.get(key))) all.push({ at, id })
   }
-  // in the same order in every house; this session's own named ''
+  // one order in every house; this session's own named ''
   all.sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   shippedToday = { day, boxes: all.map(b => ({ at: b.at, session: b.id === own ? '' : b.id })) }
 }
@@ -304,29 +294,34 @@ async function shippedOn($: EngineInterface, now: number): Promise<Shipment[]> {
   return shippedToday.day === dayOf(now) ? shippedToday.boxes : []
 }
 
-// One more box on this session's own key; a key that cannot be read is left
-// as it is rather than started over.
+// One more box on this session's key; an unreadable key is not started over.
 async function countShipped($: EngineInterface, now: number): Promise<void> {
-  const key = `shipped:${dayOf(now)}:${self?.id ?? 'local'}`
+  const key = `shipped:${dayOf(now)}:${await ownId($)}`
   const sofar = await $.store.get(key)
   await $.store.set(key, [...numbers(sofar), now])
   await readShipped($, now)
 }
 
-// The yard's boxes in the order they went, each by who shipped it: the
-// day's from every session, the demo's among them.
+// Today's boxes from every session and the demo, in order, each as its shipper.
 async function yardBoxes($: EngineInterface, now: number): Promise<string[]> {
   const boxes = [...await shippedOn($, now), ...demoBoxes.map(at => ({ at, session: '' }))]
   return boxes.sort((a, b) => a.at - b.at).map(b => b.session)
 }
 
-// A finished agent or task carries a box out to the pallets by the mailbox
-// (see `deliver`), and real work counts towards the day's total.
-async function finish($: EngineInterface, id: string, activity: string): Promise<void> {
+// A finished member carries a box to the pallets (see `deliver`), one at a time so none share a place.
+let finishing: Promise<unknown> = Promise.resolve()
+
+function finish($: EngineInterface, id: string, activity: string): Promise<void> {
+  const run = finishing.then(() => finishOne($, id, activity), () => finishOne($, id, activity))
+  finishing = run.catch(() => undefined)
+  return run
+}
+
+async function finishOne($: EngineInterface, id: string, activity: string): Promise<void> {
   const member = (await read($, residents)).find(c => c.id === id)
   if (!member || member.status === 'done' || member.session) return
   const now = await $.clock.now()
-  // the next free place on the pallets, with every session's latest counted
+  // the next free pallet place, counting every session's latest
   await readShipped($, now).catch(() => undefined)
   const box = (await yardBoxes($, now)).length
   let isShipped = false
@@ -338,7 +333,7 @@ async function finish($: EngineInterface, id: string, activity: string): Promise
       if (c.id !== id || c.status === 'done' || c.session) return c
       isShipped = true
       isDemo = c.isDemo === true
-      // a shell or monitor keeps what it ran as its name; the end goes to its status
+      // a shell or monitor keeps its command; the end goes to its status
       const keepsCommand = c.id !== MAIN && taskTypeOf(c) !== 'subagent'
       return { ...c, status: 'done', ...(keepsCommand ? {} : { activity }), taskStatus: activity.toLowerCase(), doneAt: now, idleSince: now, carrying: true, box }
     }))
@@ -349,11 +344,19 @@ async function finish($: EngineInterface, id: string, activity: string): Promise
   await sendOut($, id)
 }
 
-// Timers for boxes on their way, one per courier.
+// Corrects a task taken as completed once the engine's notice says how it ended.
+async function restate($: EngineInterface, id: string, word: string): Promise<void> {
+  await change($, list => list.map(c => {
+    if (c.id !== id || c.status !== 'done' || c.session || c.taskStatus === word.toLowerCase()) return c
+    const keepsCommand = c.id !== MAIN && taskTypeOf(c) !== 'subagent'
+    return { ...c, ...(keepsCommand ? {} : { activity: word }), taskStatus: word.toLowerCase() }
+  }))
+}
+
+// One timer per courier on its way.
 const errands = new Map<string, { cancel: () => void }>()
 
-// Sees a courier back in from the pallets when its errand ends: sets out
-// again after a reload, and lands at once one that ended meanwhile.
+// Brings a courier back when its errand ends; after a reload, one overdue lands at once.
 async function sendOut($: EngineInterface, id: string): Promise<void> {
   const now = await $.clock.now()
   const end = errandEnds(ordered(await read($, residents)), now).get(id)
@@ -366,13 +369,12 @@ async function sendOut($: EngineInterface, id: string): Promise<void> {
   }))
 }
 
-// Back from the pallets, the box stacked: it goes about its day from here.
+// Back from the pallets, box stacked.
 async function deliver($: EngineInterface, id: string): Promise<void> {
   const now = await $.clock.now()
   await change($, list => settle(list.map(c => (c.id === id && c.carrying ? { ...without(without(c, 'carrying'), 'box'), idleSince: now } : c))))
 }
 
-// The lead first, then whoever is working, then the idle, then the finished.
 function ordered(list: Resident[]): Resident[] {
   const rank = (c: Resident) => (c.id === MAIN ? 0 : isLive(c) ? 1 : c.status === 'idle' ? 2 : 3)
   return list.map((c, i) => ({ c, i })).sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i).map(x => x.c)
@@ -381,7 +383,6 @@ function ordered(list: Resident[]): Resident[] {
 // Where a member stands, for its hover card.
 type State = 'running' | 'waiting' | 'pending' | 'idle' | 'done' | 'failed' | 'stopped'
 
-// How a task ended, from the engine's word when it gave one.
 function endState(c: Resident): State {
   const w = (c.taskStatus ?? c.activity).toLowerCase()
   if (/kill|stop|cancel|abort/.test(w)) return 'stopped'
@@ -398,7 +399,6 @@ const STATE_WORD: Record<State, string> = {
 
 const HOUR = 60 * 60 * 1000
 const WEEK = 7 * 24 * HOUR
-const MAX_USAGE = 400
 
 function tokensSince(usage: number[] | undefined, since: number): number {
   let sum = 0
@@ -406,21 +406,20 @@ function tokensSince(usage: number[] | undefined, since: number): number {
   return sum
 }
 
-// Adds a turn's tokens, forgets anything older than a week, and folds the
-// oldest entries together once there are many.
+// One pair per hour, at its latest time, so a week is at most 168; pairs before `since` drop.
+function byHour(flat: number[], since = 0): number[] {
+  const hours = new Map<number, [number, number]>()
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    const [t, n] = [flat[i] ?? 0, flat[i + 1] ?? 0]
+    if (t < since) continue
+    const was = hours.get(Math.floor(t / HOUR))
+    hours.set(Math.floor(t / HOUR), [Math.max(t, was?.[0] ?? 0), n + (was?.[1] ?? 0)])
+  }
+  return [...hours.values()].sort((a, b) => a[0] - b[0]).flat()
+}
+
 function addUsage(usage: number[] | undefined, now: number, tokens: number): number[] {
-  const kept: number[] = []
-  for (let i = 0; i + 1 < (usage?.length ?? 0); i += 2) {
-    if ((usage?.[i] ?? 0) >= now - WEEK) kept.push(usage?.[i] ?? 0, usage?.[i + 1] ?? 0)
-  }
-  kept.push(now, tokens)
-  // past the cap, the two oldest entries merge under the older time, so old
-  // tokens age out of the week no later than they should
-  while (kept.length > MAX_USAGE) {
-    kept[1] = (kept[1] ?? 0) + (kept[3] ?? 0)
-    kept.splice(2, 2)
-  }
-  return kept
+  return byHour([...(usage ?? []), now, tokens], now - WEEK)
 }
 
 function compact(n: number): string {
@@ -430,22 +429,18 @@ function compact(n: number): string {
   return `${(n / 1e6).toFixed(1)}M`
 }
 
-// Tokens over the week, as the hover cards show them: the lead's spans
-// sessions, anyone else's is its one run.
+// The week's tokens: the lead's span sessions, anyone else's is its one run.
 function usageText(c: Resident, now: number): string | undefined {
   const week = tokensSince(c.usage, now - WEEK)
   return week === 0 ? undefined : compact(week)
 }
 
-// What a request cost: fresh input, input written to the cache, and output.
-// Input read back from the cache is left out, being nearly free.
+// A request's cost; cache reads are left out, being nearly free.
 function tokensOf(u: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number } | null | undefined): number {
   return u ? u.input_tokens + u.cache_creation_input_tokens + u.output_tokens : 0
 }
 
-// The lead's usage is kept across sessions, so its week is a real week: each
-// session writes its own key and the figure is their sum, so sessions side by
-// side never write over one another.
+// The lead's usage spans sessions, a key each, summed so none overwrite another.
 const LEAD_USAGE = 'usage:lead'
 let ownKey: string | undefined
 
@@ -458,57 +453,58 @@ async function leadKey($: EngineInterface): Promise<string> {
 
 const numbers = (v: unknown) => (Array.isArray(v) ? v.filter((n): n is number => typeof n === 'number') : [])
 
-// Every session's, an hour to an entry, under the hour's latest time, so the
-// lead's figure stays small however many sessions there were. Undefined when
-// the store cannot be read, so the session's own figures stand.
-async function leadUsage($: EngineInterface): Promise<number[] | undefined> {
+// The lead's usage over all sessions, others' read at most once a minute; undefined if the store fails.
+let othersUsage: { at: number; flat: number[] } | undefined
+
+async function leadUsage($: EngineInterface, mine?: number[]): Promise<number[] | undefined> {
   try {
-    const keys = (await $.store.keys()).filter(k => k.startsWith(LEAD_USAGE))
-    const hours = new Map<number, [number, number]>()
-    for (const key of keys) {
-      const v = numbers(await $.store.get(key))
-      for (let i = 0; i + 1 < v.length; i += 2) {
-        const [t, n] = [v[i] ?? 0, v[i + 1] ?? 0]
-        const was = hours.get(Math.floor(t / HOUR))
-        hours.set(Math.floor(t / HOUR), [Math.max(t, was?.[0] ?? 0), n + (was?.[1] ?? 0)])
-      }
+    const now = await $.clock.now()
+    const own = await leadKey($)
+    if (!othersUsage || now - othersUsage.at > MINUTE) {
+      const flat: number[] = []
+      for (const key of (await $.store.keys()).filter(k => k.startsWith(LEAD_USAGE) && k !== own)) flat.push(...numbers(await $.store.get(key)))
+      othersUsage = { at: now, flat: byHour(flat) }
     }
-    return [...hours.values()].sort((a, b) => a[0] - b[0]).flat()
+    return byHour([...othersUsage.flat, ...(mine ?? numbers(await $.store.get(own)))])
   } catch {
     return undefined
   }
 }
 
-// Old days' counts and week-old usage keys go, so the store never grows.
+// Drops old days' counts, week-old usage and dead sessions (a crashed one never deletes its own).
 async function pruneStore($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   const today = dayOf(now)
   for (const key of await $.store.keys()) {
     if (key.startsWith('shipped:') && !key.startsWith(`shipped:${today}`)) await $.store.delete(key)
+    if (key.startsWith(PEER)) {
+      const v = await $.store.get(key) as Partial<Snapshot> | undefined
+      if (now - (typeof v?.at === 'number' ? v.at : 0) > FORGET_AFTER) await $.store.delete(key)
+    }
     if (key.startsWith(LEAD_USAGE)) {
       const v = numbers(await $.store.get(key))
-      const newest = v.filter((_, i) => i % 2 === 0).reduce((a, b) => Math.max(a, b), 0)
+      const newest = v.filter((_t, i) => i % 2 === 0).reduce((a, b) => Math.max(a, b), 0)
       if (newest < now - WEEK) await $.store.delete(key)
     }
   }
 }
 
-// Adds one request's tokens to whoever made it. Only the usage changes, so
-// nobody's plan does and the household skips the reanchoring `change` does.
+// No plan changes here, so this skips `change` and its reanchoring.
 async function recordUsage($: EngineInterface, id: string, tokens: number): Promise<void> {
   if (tokens <= 0) return
   const now = await $.clock.now()
   if (id === MAIN) {
-    const usage = await serial(async () => {
+    await serial(async () => {
       const key = await leadKey($)
       const kept = (await read($, residents)).find(c => c.id === MAIN)?.usage
       const stored = await $.store.get(key).then(numbers, () => undefined)
-      if (stored === undefined) return addUsage(kept, now, tokens)
-      const mine = addUsage(stored, now, tokens)
-      const saved = await $.store.set(key, mine).then(() => true, () => false)
-      return saved ? await leadUsage($) ?? mine : addUsage(kept, now, tokens)
+      let usage = addUsage(kept, now, tokens)
+      if (stored !== undefined) {
+        const mine = addUsage(stored, now, tokens)
+        if (await $.store.set(key, mine).then(() => true, () => false)) usage = await leadUsage($, mine) ?? mine
+      }
+      await update($, residents, list => (list.length === 0 ? [LEAD] : list).map(c => (c.id === MAIN ? { ...c, usage } : c)))
     })
-    await update($, residents, list => (list.length === 0 ? [LEAD] : list).map(c => (c.id === MAIN ? { ...c, usage } : c)))
     return
   }
   // nobody to add to: an engine fork's step, say
@@ -518,32 +514,187 @@ async function recordUsage($: EngineInterface, id: string, tokens: number): Prom
 
 // ---------- the plan's windows, for the vibe fatigue band ----------
 
-// The five-hour and weekly windows as Claude Code itself last read them,
-// off its latest response: nothing leaves the machine for them. A window it
-// has not read keeps its last reading, and an unchanged one redraws nothing.
-async function refreshPlan($: EngineInterface): Promise<void> {
-  const { rateLimits } = await $.session.usage({})
-  const five = rateLimits.find(r => r.kind === 'five_hour')?.percentUsed
-  const week = rateLimits.find(r => r.kind === 'seven_day')?.percentUsed
-  const was = await read($, plan)
-  const now = { ...was, ...(five !== undefined ? { fiveHour: five } : {}), ...(week !== undefined ? { week } : {}) }
-  if (now.fiveHour !== was.fiveHour || now.week !== was.week) await update($, plan, () => now)
+// Read off Claude Code's response headers, so nothing leaves the machine; the account's newest is shared.
+const PLAN_KEY = 'plan'
+const MINUTE = 60 * 1000
+
+// A reading taken `at`; none off a subscription or before the first response.
+function readingOf(limits: readonly SessionRateLimit[], at: number): PlanUse | undefined {
+  const five = limits.find(r => r.kind === 'five_hour')
+  const week = limits.find(r => r.kind === 'seven_day')
+  if (!five && !week) return undefined
+  const resets = (r: SessionRateLimit) => (r.resetsAt ? Date.parse(r.resetsAt) : NaN)
+  const out: PlanUse = { at }
+  if (five) {
+    out.fiveHour = five.percentUsed
+    if (Number.isFinite(resets(five))) out.fiveHourResets = resets(five)
+  }
+  if (week) {
+    out.week = week.percentUsed
+    if (Number.isFinite(resets(week))) out.weekResets = resets(week)
+  }
+  return out
 }
 
-// Cells in each of the band's plan bars.
+// A stored reading, checked field by field, percentages floored at zero.
+function planFrom(raw: unknown): PlanUse | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const v = raw as Record<string, unknown>
+  const out: PlanUse = {}
+  for (const k of ['at', 'fiveHour', 'fiveHourResets', 'week', 'weekResets'] as const) {
+    const n = v[k]
+    if (typeof n === 'number' && Number.isFinite(n)) out[k] = k === 'fiveHour' || k === 'week' ? Math.max(0, n) : n
+  }
+  return out.at !== undefined ? out : undefined
+}
+
+// A newer reading over an older, window by window.
+function newer(was: PlanUse, r: PlanUse): PlanUse {
+  const five = r.fiveHour !== undefined ? r : was
+  const week = r.week !== undefined ? r : was
+  return {
+    ...(r.at !== undefined ? { at: r.at } : {}),
+    ...(five.fiveHour !== undefined ? { fiveHour: five.fiveHour } : {}),
+    ...(five.fiveHourResets !== undefined ? { fiveHourResets: five.fiveHourResets } : {}),
+    ...(week.week !== undefined ? { week: week.week } : {}),
+    ...(week.weekResets !== undefined ? { weekResets: week.weekResets } : {}),
+  }
+}
+
+// The windows at `now`: one past its reset is blank until a response brings the next.
+function current(p: PlanUse, now: number): PlanUse {
+  const fiveOver = p.fiveHourResets !== undefined && p.fiveHourResets <= now
+  const weekOver = p.weekResets !== undefined && p.weekResets <= now
+  if (!fiveOver && !weekOver) return p
+  return {
+    ...(p.at !== undefined ? { at: p.at } : {}),
+    ...(!fiveOver && p.fiveHour !== undefined ? { fiveHour: p.fiveHour } : {}),
+    ...(!fiveOver && p.fiveHourResets !== undefined ? { fiveHourResets: p.fiveHourResets } : {}),
+    ...(!weekOver && p.week !== undefined ? { week: p.week } : {}),
+    ...(!weekOver && p.weekResets !== undefined ? { weekResets: p.weekResets } : {}),
+  }
+}
+
+const sameWindows = (a: PlanUse, b: PlanUse) =>
+  a.fiveHour === b.fiveHour && a.fiveHourResets === b.fiveHourResets && a.week === b.week && a.weekResets === b.weekResets
+
+// Shows a newer, different local reading, and stores it unless the store's is newer.
+async function takeReading($: EngineInterface, reading: PlanUse | undefined, now: number): Promise<void> {
+  const at = reading?.at
+  if (!reading || at === undefined) return
+  // the reading applied to `was`, if it says anything new
+  const over = (was: PlanUse) => {
+    if (at <= (was.at ?? 0)) return undefined
+    const merged = current(newer(was, reading), now)
+    return sameWindows(merged, was) ? undefined : merged
+  }
+  if (!over(await read($, plan))) return
+  let wrote: PlanUse | undefined
+  await update($, plan, was => (wrote = over(was)) ?? was)
+  if (!wrote) return
+  const stored = planFrom(await $.store.get(PLAN_KEY).catch(() => undefined))
+  if ((stored?.at ?? 0) < at) await $.store.set(PLAN_KEY, wrote).catch(() => undefined)
+}
+
+// Adopts the store's newer reading, else restores this one's (two writes may race); false if none stored.
+async function adoptPlan($: EngineInterface, now: number): Promise<boolean> {
+  const stored = planFrom(await $.store.get(PLAN_KEY))
+  if (!stored) return false
+  const at = stored.at ?? 0
+  const was = await read($, plan)
+  if (at > (was.at ?? 0)) await update($, plan, p => (at > (p.at ?? 0) ? current(newer(p, stored), now) : p))
+  else if ((was.at ?? 0) > at) await $.store.set(PLAN_KEY, was).catch(() => undefined)
+  return true
+}
+
+// At start: the store's newest reading, else Claude Code's own.
+async function startPlan($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  await update($, minute, () => now)
+  if (await adoptPlan($, now)) return
+  const { rateLimits } = await $.session.usage({})
+  await takeReading($, readingOf(rateLimits, now), now)
+}
+
+// Session setup, each step on its own so one failing leaves the rest.
+async function begin($: EngineInterface): Promise<void> {
+  // a session resumed here after ending shares again
+  endedHere.clear()
+  await $.command.register({
+    name: 'haus',
+    description: 'Show Vibehaus · "demo" fills it with a demo household · "snapshot" saves it as an SVG',
+    argumentHint: '[demo | snapshot]',
+    immediate: true,
+  }).catch(() => undefined)
+  try {
+    const usage = await leadUsage($)
+    await change($, list => list.filter(c => !c.isDemo).map(c => (c.id === MAIN && usage ? { ...c, usage } : c)))
+    for (const c of await read($, residents)) if (c.carrying && !c.session) await sendOut($, c.id)
+  } catch {
+    // the household as it is
+  }
+  void endQuietly($).catch(() => undefined)
+  $.clock.after(ENDING_GRACE, () => void endQuietly($).catch(() => undefined))
+  void startSharing($).catch(() => undefined)
+  void startPlan($).catch(() => undefined)
+  void pruneStore($).catch(() => undefined)
+}
+
+// Each minute: resets count down and a window past its reset loses its reading.
+async function tickPlan($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  await update($, minute, () => now)
+  const was = await read($, plan)
+  if (current(was, now) !== was) await update($, plan, p => current(p, now))
+}
+let ticker: { cancel: () => void } | undefined
+
+// Cells per plan bar when the band's width is unknown.
 const BAR = 8
 
 function metersOf(p: PlanUse): Meter[] {
   return [
-    { label: '5H', color: '#52d2f5', ...(p.fiveHour !== undefined ? { percent: p.fiveHour } : {}) },
-    { label: 'WEEK', color: '#4cf08c', ...(p.week !== undefined ? { percent: p.week } : {}) },
+    { label: '5H', color: '#52d2f5', ...(p.fiveHour !== undefined ? { percent: p.fiveHour } : {}), ...(p.fiveHourResets !== undefined ? { resets: p.fiveHourResets } : {}) },
+    { label: 'Week', color: '#4cf08c', ...(p.week !== undefined ? { percent: p.week } : {}), ...(p.weekResets !== undefined ? { resets: p.weekResets } : {}) },
   ]
 }
 
-// Where a member stands, as its hover card words it.
+// A reset time as the band words it: minutes or hours today, else the weekday.
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+function resetText(at: number, now: number): string {
+  const m = Math.max(1, Math.ceil((at - now) / MINUTE))
+  if (m < 60) return `${m}m`
+  if (m < 24 * 60) return m % 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m / 60}h`
+  return DAYS[new Date(at).getDay()] ?? ''
+}
+
+// Bar width and reset wording: full resets while bars keep BAR_ROOMY cells, then short, then none.
+const TOGGLE = '◧ Vibehaus'
+const BAR_MIN = 3
+const BAR_ROOMY = 4
+const BAR_MAX = 40
+const percentText = (m: Meter) => (m.percent === undefined ? '--' : `${Math.round(m.percent)}%`)
+
+function bandOf(meters: Meter[], columns: number | undefined, now: number): { bar: number; words: string[] } {
+  const wordings = [(t: string) => `Resets ${t}`, (t: string) => t, () => '']
+  let last = { bar: BAR_MIN, words: meters.map(() => '') }
+  for (const [i, say] of wordings.entries()) {
+    const words = meters.map(m => (m.percent !== undefined && m.resets !== undefined ? say(resetText(m.resets, now)) : ''))
+    if (columns === undefined) return { bar: BAR, words }
+    // the toggle, gaps, a spare cell, and each meter's words: "5H ", " 42%", " · 2h 10m"
+    const fixed = TOGGLE.length + 2 * meters.length + 1
+      + meters.reduce((n, m, k) => n + m.label.length + 2 + percentText(m).length + (words[k] ? 3 + [...(words[k] as string)].length : 0), 0)
+    const bar = Math.floor((columns - fixed) / meters.length)
+    if (bar >= (i < wordings.length - 1 ? BAR_ROOMY : BAR_MIN)) return { bar: Math.min(BAR_MAX, bar), words }
+    last = { bar: BAR_MIN, words }
+  }
+  return last
+}
+
 function stateOf(c: Resident): State {
   if (c.kind === 'main') return c.status === 'waiting' ? 'waiting' : c.status === 'working' ? 'running' : 'idle'
   if (c.status === 'waiting') return 'waiting'
+  if (c.isTeammate && c.status === 'idle') return 'idle'
   if (isLive(c)) return c.taskStatus === 'pending' ? 'pending' : 'running'
   return endState(c)
 }
@@ -552,8 +703,7 @@ function ended(status: string): string {
   return status.charAt(0).toUpperCase() + status.slice(1)
 }
 
-// One entry of the engine's in-flight background work (the Stop hooks'
-// `background_tasks`); long texts end in a "... [+N chars]" marker.
+// One of the Stop hooks' `background_tasks`; long texts end in "... [+N chars]".
 type TaskSummary = {
   id: string
   type: string
@@ -575,7 +725,7 @@ function fromSummary(t: TaskSummary): Resident {
     name: isAgent ? description || kind : `Background ${t.type}`,
     kind,
     room: isAgent ? roomForKind(kind) : t.type === 'shell' || t.type === 'monitor' ? 'kitchen' : t.server ? 'sunroom' : 'study',
-    // when it started is unknown: no start time rather than a wrong one
+    // start unknown: none rather than a wrong one
     movedAt: 0,
     status: 'working',
     activity: oneLine(t.command?.replace(CLIPPED, '…') || description || t.name || t.type),
@@ -585,12 +735,8 @@ function fromSummary(t: TaskSummary): Resident {
   }
 }
 
-// Brings the household in line with the engine's list of background work, taken
-// at `asOf`: tasks it runs that the household lacks join, and running tasks it no
-// longer has end. Anything that started after the list was taken is left be.
-// Subagents are checked against the engine's agent list instead, since a
-// foreground one is not background work; workflow agents and teammates are
-// listed by neither, so they are left be too.
+// Syncs to the engine's background list as of `asOf`: missing tasks join, vanished ones end, newer stay.
+// Agents go by the agent list instead (foreground ones are not background); workflow agents are in neither.
 async function reconcile($: EngineInterface, tasks: readonly TaskSummary[] | undefined, asOf: number): Promise<void> {
   if (!tasks) return
   const live = new Map(tasks.map(t => [t.id, t]))
@@ -612,7 +758,7 @@ async function reconcile($: EngineInterface, tasks: readonly TaskSummary[] | und
       if (t) return c.status === 'done' ? c : { ...without(c, 'endingSince'), taskType: t.type, taskStatus: t.status }
       const seen = c.spawnedAt ?? c.workSince
       const isOld = seen === undefined || seen < asOf
-      // a teammate, working or idle, ends when the engine no longer lists it
+      // a teammate, working or idle, ends once the engine stops listing it
       if (c.isTeammate && agents && c.status !== 'done') {
         const s = agents.get(c.id)
         if (isOld && hasEnded(s)) over.push({ id: c.id, word: s ?? 'completed' })
@@ -625,8 +771,7 @@ async function reconcile($: EngineInterface, tasks: readonly TaskSummary[] | und
         if (hasEnded(s)) over.push({ id: c.id, word: s ?? 'completed' })
         return c
       }
-      // background work gone from the list: its own notice of how it ended
-      // may still be on its way, so it ends as completed only after a moment
+      // gone from the list: its end notice may be coming, so it ends as completed after a moment
       isEnding = true
       return c.endingSince !== undefined ? c : { ...c, endingSince: asOf }
     })
@@ -641,7 +786,7 @@ async function reconcile($: EngineInterface, tasks: readonly TaskSummary[] | und
   if (isEnding) $.clock.after(ENDING_GRACE, () => void endQuietly($).catch(() => undefined))
 }
 
-// How long background work gone from the engine's list waits for its notice.
+// How long work gone from the engine's list waits for its notice.
 const ENDING_GRACE = 5000
 
 async function endQuietly($: EngineInterface): Promise<void> {
@@ -650,7 +795,6 @@ async function endQuietly($: EngineInterface): Promise<void> {
   for (const c of due) await finish($, c.id, 'Completed')
 }
 
-// The lead's context window use, in percent, when the engine knows it.
 async function contextNow($: EngineInterface): Promise<number | undefined> {
   try {
     const usage = await $.session.usage({})
@@ -662,55 +806,54 @@ async function contextNow($: EngineInterface): Promise<number | undefined> {
 
 // ---------- other sessions in the same house ----------
 
-// Every session running Vibehaus writes its own household to the shared store
-// under a key of its own, and reads the others': their agents come in from
-// the street and live here like this session's own. A session that stops
-// writing moves out, back down the road, and so does one with nobody at
-// work in it that nobody has messaged and nothing has worked in for five
-// hours, until it is busy again.
+// Each session shares its household under its own key; the others' agents walk in from the street.
+// One that stops writing, or idles unmessaged for five hours, moves out until busy again.
 const PEER = 'session:'
 const SYNC_EVERY = 3000
 const BEAT_EVERY = 10000
 const GONE_AFTER = 35000
 const FORGET_AFTER = HOUR
 const ACTIVE_FOR = 5 * HOUR
-// seconds between visitors setting off up the road together
-const ARRIVE_GAP = 1.5
 
-type Snapshot = { at: number; since: number; activeAt: number; name: string; residents: Resident[] }
+// What a session writes, with when it last woke from a long sleep.
+type Snapshot = { at: number; since: number; activeAt: number; name: string; residents: Resident[]; wokeAt?: number }
 
-// When a session was last busy: its last message, tool call, agent or task
-// starting or ending, as its own members remember it.
+// When a session was last busy, by its members' latest times.
 const activeAtOf = (mine: Resident[]) => Math.max(0, ...mine.flatMap(c => [c.workSince, c.spawnedAt, c.resultAt, c.doneAt, c.idleSince, ...(c.calls ?? [])].filter((t): t is number => typeof t === 'number')))
 type Peer = { id: string; name: string; since: number }
 
-// This session as the others know it, its name as every house shows it, and
-// the others as last read.
+// This session as the others know it, and the others as last read.
 let self: { id: string; name: string; since: number } | undefined
 let peers: Peer[] = []
+// sessions gone, whose households are still walking out
+let going: Peer[] = []
 let lastSync = 0
 let shared = { at: 0, text: '' }
+// sessions seen ending here, so late changes do not share them again; then the sleep state
+const endedHere = new Map<string, number>()
+const END_QUIET = 10000
+let wasAsleep = false
+let wokeAt = 0
 let publishing: { cancel: () => void } | undefined
 let sharing: Promise<void> | undefined
-// each start of sharing, so one stopped while it starts knows to give up
+// counts starts, so one stopped mid-start gives up
 let runs = 0
 let beats: { cancel: () => void }[] = []
 
-const peerName = (id: string) => peers.find(p => p.id === id)?.name ?? 'another session'
+const peerName = (id: string) => [...peers, ...going].find(p => p.id === id)?.name ?? 'another session'
 
 async function whoAmI($: EngineInterface): Promise<NonNullable<typeof self>> {
   const now = await $.clock.now()
   const id = await $.session.id().catch(() => 'local')
   const root = await $.session.root().catch(() => '')
   const since = await $.session.usage({}).then(u => u.startedAt).catch(() => 0)
-  // the name it went by before a reload: its title, once it had one
+  // its name before a reload: its title, once it had one
   const was = await $.store.get(PEER + id).catch(() => undefined) as Partial<Snapshot> | undefined
   const name = typeof was?.name === 'string' && was.name ? was.name : root.split(/[\\/]/).filter(Boolean).pop() ?? 'session'
   return { id, name, since: since || now }
 }
 
-// A session goes by its title as the app shows it, once the engine names it
-// (at the session's start and with each prompt); by its folder till then.
+// A session goes by its title once the engine sends one, else its folder.
 async function retitle($: EngineInterface, title: string | undefined): Promise<void> {
   const name = title ? oneLine(title).slice(0, 40) : ''
   if (!name) return
@@ -721,11 +864,18 @@ async function retitle($: EngineInterface, title: string | undefined): Promise<v
   await publish($)
 }
 
-// What the others see of a member: nothing that is only this house's.
-const outward = (c: Resident) => without(without(without(without(c, 'anchor'), 'seat'), 'usage'), 'endingSince')
+// What others see: nothing house-local, of its work only the tool and file name, never a command or query.
+const FILE_TOOLS = /^(Read|Edit|Write|MultiEdit|NotebookEdit|NotebookRead)$/
+function outward(c: Resident): Resident {
+  const kept = without(without(without(without(c, 'anchor'), 'seat'), 'usage'), 'endingSince')
+  const isTask = c.id !== MAIN && taskTypeOf(c) !== 'subagent'
+  const activity = isTask
+    ? c.status === 'done' ? ended(c.taskStatus ?? 'done') : 'Running'
+    : c.tool && c.activity.startsWith(`${c.tool}: `) && !FILE_TOOLS.test(c.tool) ? c.tool : c.activity
+  return { ...kept, activity }
+}
 
-// Writes this session's own members for the others, at most every two
-// seconds, and again every few seconds as a sign of life.
+// Shares this session's members at most every two seconds, and each beat as a sign of life.
 async function publish($: EngineInterface, beat = false): Promise<void> {
   const me = self
   if (!me) return
@@ -738,7 +888,13 @@ async function publish($: EngineInterface, beat = false): Promise<void> {
     return
   }
   const mine = (await read($, residents)).filter(c => !c.session && !c.isDemo).map(outward)
-  const body = { since: me.since, activeAt: activeAtOf(mine), name: me.name, residents: mine }
+  // a session just started is not asleep, whatever its members did
+  const activeAt = Math.max(me.since, activeAtOf(mine))
+  // marks waking from a long sleep, so every house sees it arrive at once
+  const asleep = !mine.some(isLive) && now - activeAt > ACTIVE_FOR
+  if (wasAsleep && !asleep) wokeAt = now
+  wasAsleep = asleep
+  const body = { since: me.since, activeAt, name: me.name, residents: mine, ...(wokeAt ? { wokeAt } : {}) }
   const text = JSON.stringify(body)
   if ((!beat && text === shared.text) || self !== me) return
   shared = { at: now, text }
@@ -748,8 +904,7 @@ async function publish($: EngineInterface, beat = false): Promise<void> {
 const ROOMS = new Set<string>(ALL_ROOMS)
 const STATUSES = new Set<string>(['working', 'waiting', 'idle', 'done'])
 
-// Another session's member as it wrote it, checked field by field: a field
-// of the wrong shape is left out, and a member without its essentials too.
+// Another session's member, checked field by field; one lacking essentials is dropped.
 function memberOf(raw: unknown): Resident | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined
   const m = raw as Record<string, unknown>
@@ -775,8 +930,7 @@ function memberOf(raw: unknown): Resident | undefined {
   return out
 }
 
-// Names as every house shows them: each session's own, and for two of one
-// name, the later ones numbered.
+// Session names as every house shows them, repeats numbered.
 function nameAll(list: { id: string; name: string; since: number }[]): Map<string, string> {
   const seen = new Map<string, number>()
   const out = new Map<string, string>()
@@ -788,39 +942,55 @@ function nameAll(list: { id: string; name: string; since: number }[]): Map<strin
   return out
 }
 
-async function readPeers($: EngineInterface, own: string, now: number): Promise<(Peer & { residents: Resident[] })[]> {
-  const found: (Peer & { residents: Resident[] })[] = []
+type Visible = Peer & Household
+
+// Other sessions to show: neither stopped writing nor asleep. Long-stale keys are cleared.
+async function readPeers($: EngineInterface, own: string, now: number): Promise<Visible[]> {
+  const found: Visible[] = []
+  const time = (t: unknown) => (typeof t === 'number' && Number.isFinite(t) ? t : undefined)
   for (const key of await $.store.keys()) {
     if (!key.startsWith(PEER) || key === PEER + own) continue
     const v = await $.store.get(key) as Partial<Snapshot> | undefined
-    const at = typeof v?.at === 'number' ? v.at : 0
+    const at = time(v?.at) ?? 0
     if (now - at > FORGET_AFTER) {
       await $.store.delete(key).catch(() => undefined)
       continue
     }
     if (!v || now - at > GONE_AFTER || !Array.isArray(v.residents)) continue
     const members = v.residents.flatMap(m => memberOf(m) ?? [])
-    if (!members.some(isLive) && now - (typeof v.activeAt === 'number' ? v.activeAt : 0) > ACTIVE_FOR) continue
+    if (!members.some(isLive) && now - (time(v.activeAt) ?? 0) > ACTIVE_FOR) continue
+    const woke = time(v.wokeAt)
     found.push({
       id: key.slice(PEER.length), name: oneLine(String(v.name || 'session')).slice(0, 40),
-      since: Number(v.since) || 0, residents: members,
+      since: time(v.since) ?? 0, residents: members, ...(woke !== undefined ? { wokeAt: woke } : {}),
     })
   }
   return found.sort((a, b) => a.since - b.since || (a.id < b.id ? -1 : 1))
 }
 
-// Reads the other sessions and moves their members in; a session gone quiet
-// moves out, and so does everyone else once the store has been out of reach
-// that long.
+// Moves other sessions in and quiet ones out; all go if the store stays out of reach as long.
+let syncing = false
+
 async function syncPeers($: EngineInterface): Promise<void> {
+  if (syncing) return
+  syncing = true
+  try {
+    await syncOnce($)
+  } finally {
+    syncing = false
+  }
+}
+
+async function syncOnce($: EngineInterface): Promise<void> {
   const me = self
   if (!me) return
   const now = await $.clock.now()
-  let found: (Peer & { residents: Resident[] })[]
+  let found: Visible[]
   try {
     found = await readPeers($, me.id, now)
   } catch {
     if (now - lastSync > GONE_AFTER) {
+      going = [...peers, ...going]
       peers = []
       paintHomes()
       await change($, list => visit(list, [], now))
@@ -829,45 +999,20 @@ async function syncPeers($: EngineInterface): Promise<void> {
   }
   lastSync = now
   await readShipped($, now).catch(() => undefined)
+  await adoptPlan($, now).catch(() => false)
   const names = nameAll([me, ...found])
+  const was = [...peers, ...going]
   peers = found.map(f => ({ id: f.id, name: names.get(f.id) ?? f.name, since: f.since }))
+  // a session gone keeps its colour and name while its household walks out
+  const here = await read($, residents)
+  going = was.filter(p => !found.some(f => f.id === p.id) && here.some(c => c.session === p.id))
   paintHomes()
-  // alone, with nobody else's left to see out: nothing to change
-  if (found.length === 0 && !(await read($, residents)).some(c => c.session)) return
+  // alone, with no visitors left to see out: nothing to change
+  if (found.length === 0 && !here.some(c => c.session)) return
   await change($, list => visit(list, found, now))
 }
 
-// The others' members as they are now, each keeping the spot and desk it has
-// here. A newcomer walks in from the street, the next a moment behind; one on
-// its way in keeps coming until it is in; one its session let go walks back
-// out to the street and is gone at the end of the road.
-function visit(list: Resident[], found: { id: string; residents: Resident[] }[], now: number): Resident[] {
-  const here = new Map(list.filter(c => c.session).map(c => [c.id, c]))
-  const ends = here.size > 0 ? errandEnds(list, now) : new Map<string, number>()
-  const isThere = (c: Resident) => (ends.get(c.id) ?? 0) <= now
-  const seen = new Set<string>()
-  let queue = 0
-  const theirs = found.flatMap(f => f.residents.map((m): Resident => {
-    const id = `${f.id}/${m.id}`
-    seen.add(id)
-    const had = here.get(id)
-    const member: Resident = { ...m, id, session: f.id }
-    if (!had) return arrive(member, now, ARRIVE_GAP * queue++)
-    return {
-      ...member,
-      ...(had.anchor ? { anchor: had.anchor } : {}),
-      ...(had.seat !== undefined ? { seat: had.seat } : {}),
-      ...(had.arriving !== undefined && !isThere(had) ? { arriving: had.arriving } : {}),
-    }
-  }))
-  const gone = [...here.values()]
-    .filter(c => !seen.has(c.id) && !(c.leaving !== undefined && isThere(c)))
-    .map(c => (c.leaving !== undefined ? c : { ...c, leaving: now }))
-  return [...list.filter(c => !c.session), ...theirs, ...gone]
-}
-
-// Starts sharing once: at the session's start, or at the first change to the
-// household when the start came before the world could answer.
+// Starts sharing once: at session start, or the first change if the world could not answer yet.
 function startSharing($: EngineInterface): Promise<void> {
   if (sharing) return sharing
   const run = ++runs
@@ -875,6 +1020,12 @@ function startSharing($: EngineInterface): Promise<void> {
     const me = await whoAmI($)
     // stopped while it asked
     if (run !== runs) return
+    // ended just now: after /clear the next change uses the new id; a resumed one shares again
+    const endedAt = endedHere.get(me.id)
+    if (endedAt !== undefined && await $.clock.now() - endedAt < END_QUIET) {
+      sharing = undefined
+      return
+    }
     self = me
     for (const beat of beats) beat.cancel()
     beats = [
@@ -884,11 +1035,13 @@ function startSharing($: EngineInterface): Promise<void> {
     await publish($, true).catch(() => undefined)
     await syncPeers($).catch(() => undefined)
   })()
+  // failed: the next change tries again
+  sharing.catch(() => {
+    if (run === runs) sharing = undefined
+  })
   return sharing
 }
 
-// A session ending stops sharing and takes its key with it; after /clear the
-// next change starts again under the new session's id.
 async function stopSharing($: EngineInterface): Promise<void> {
   for (const beat of beats) beat.cancel()
   beats = []
@@ -898,29 +1051,32 @@ async function stopSharing($: EngineInterface): Promise<void> {
   runs++
   const me = self
   self = undefined
+  if (me) endedHere.set(me.id, await $.clock.now().catch(() => 0))
   peers = []
+  going = []
   paintHomes()
   shared = { at: 0, text: '' }
+  wasAsleep = false
+  wokeAt = 0
   if (me) await $.store.delete(PEER + me.id).catch(() => undefined)
 }
 
-// Each session in the house gets its colour, by when it moved in; this one
-// alone takes none.
+// Colours each session by when it moved in; none while this one is alone.
 function paintHomes(): void {
-  if (!self || peers.length === 0) {
+  const others = [...peers, ...going]
+  if (!self || others.length === 0) {
     paintSessions([], '')
     return
   }
   const me = self
-  const all = [{ id: '', since: me.since, key: me.id }, ...peers.map(p => ({ id: p.id, since: p.since, key: p.id }))]
+  const all = [{ id: '', since: me.since, key: me.id }, ...others.map(p => ({ id: p.id, since: p.since, key: p.id }))]
     .sort((a, b) => a.since - b.since || (a.key < b.key ? -1 : 1))
   paintSessions(all.map(s => s.id), me.id)
 }
 
 // ---------- hover cards ----------
 
-// Sizes as whole percentages (all a Box takes), rounded at the running
-// edges rather than piece by piece, so the pieces add up and stay in line.
+// Whole percentages (all a Box takes), rounded at running edges so the pieces add up.
 function percents(edges: number[], whole: number): string[] {
   const at = edges.map(edge => Math.round((Math.min(Math.max(edge, 0), whole) / Math.max(1, whole)) * 100))
   return at.slice(1).map((p, i) => `${Math.max(0, p - (at[i] ?? 0))}%`)
@@ -933,15 +1089,14 @@ function ago(ms: number): string {
   return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`
 }
 
-// The card for an agent in the house: who, the task, what it is doing now,
-// and for how long at what cost.
+// An agent's hover card: who, the task, what it does, how long, at what cost.
 function agentCard(c: Resident, now: number): string[] {
   const type = taskTypeOf(c)
   const state = stateOf(c)
   const live = state === 'running' || state === 'waiting' || state === 'pending'
   const started = c.spawnedAt ?? c.workSince
   const took = started && started > 0 ? live ? ago(now - started) : c.doneAt !== undefined ? ago(c.doneAt - started) : '' : ''
-  const doing = state === 'waiting' ? `awaiting approval${c.waitingTool ? ` for ${c.waitingTool}` : ''}` : live ? c.activity : STATE_WORD[state]
+  const doing = state === 'waiting' ? `awaiting approval${c.waitingTool ? ` for ${c.waitingTool}` : ''}` : live || (state === 'idle' && c.isTeammate) ? c.activity : STATE_WORD[state]
   const used = usageText(c, now)
   const from = c.session ? `from "${peerName(c.session)}"` : ''
   if (c.kind === 'main') {
@@ -951,45 +1106,30 @@ function agentCard(c: Resident, now: number): string[] {
   return [`⧗ ${displayName(c)}`, c.activity || c.name, from, [STATE_WORD[state], took].filter(Boolean).join(' · ')].filter(Boolean)
 }
 
-// A docked pane runs floor to ceiling, and the house is wider than it is
-// tall: on the desktop the tall picture stands in the pane's middle, its
-// garden clipped evenly above and below. How much of it fits turns on how
-// tall a pane row is against a column, which the pane does not say; code
-// fonts run from about 2.3 to 2.8 times, and the low end is taken, so a pane
-// too short for the house's own stretch of the picture narrows the picture
-// enough that the house is never cut.
+// The desktop picture is centred, garden clipped evenly. A row's height against a column is unknown;
+// code fonts run about 2.3 to 2.8, and the low end is taken so the house is never cut.
 const ROW_RATIO = 2.3
-// and the high end, for the most of the garden a pane could show
+// the high end, for the most garden a pane could show
 const TALLEST_ROW = 2.8
 
-// The surface shows each picture as an image, and an image's clock can fall
-// behind the house's: it stops while the window is hidden, and starts over
-// whenever the surface loads the picture again. So every redraw draws every
-// picture afresh, on time, and the pane is redrawn at least this often, so
-// a picture left behind catches up within two seconds; no oftener, as each
-// redraw sends every picture again.
+// A picture is an image with its own clock, which stops while the window is hidden and restarts on reload.
+// So each redraw draws every picture afresh, at least this often; no oftener, as each resends them all.
 const REFRESH_MS = 2000
 // the redraw's pace while nobody in the house walks
 const QUIET_MS = 4000
 
-// A sprite's reach around the spot it stands on: its body, hat and name tag.
+// A sprite's reach round its spot: body, hat and name tag.
 const REACH = { left: 8, right: 8, up: 15, down: 6 }
-// How long a redraw takes to reach the screen, so a zone holds past it; and
-// how finely a walk is followed. In ms.
+// In ms: a redraw's lag to the screen, which a zone outlasts, and how finely a walk is followed.
 const LAG_MS = 400
 const STEP_MS = 50
 
-// Where each agent in sight can be hovered: over wherever it goes until the
-// next redraw is on screen, the spot it stands on or the stretch it walks.
-// Zones that overlap top to bottom share a band; within a band each gets one
-// cell, split halfway where two overlap side by side. So no two overlap, and
-// each is one keyed Box with the agent's card inside it, shown while the
-// pointer is over it.
+// Hover zones cover where each agent goes until the next redraw shows. Overlapping zones share a band,
+// split halfway, so each is one keyed Box holding the card.
 type Zone = { c: Resident; x0: number; x1: number; y0: number; y1: number }
 type Band = { y0: number; y1: number; cells: { c: Resident; x0: number; x1: number }[] }
 
-// the zones over the desktop's picture, in its units, a sprite's reach round
-// each spot it takes
+// zones over the desktop picture, in its units: a sprite's reach round each spot it takes
 function houseBands(list: Resident[], tracks: Track[], now: number, grid: HouseGrid): Band[] {
   const zones: Zone[] = []
   const byId = new Map(list.map(c => [c.id, c]))
@@ -1014,8 +1154,7 @@ function houseBands(list: Resident[], tracks: Track[], now: number, grid: HouseG
   return bandsOf(zones)
 }
 
-// the zones over the terminal's plan, in its cells: each agent's Clawd and
-// name at each cell it takes
+// zones over the terminal plan, in cells: each agent's Clawd and name at each cell it takes
 function planBands(plan: Plan, walkers: Walker[], now: number): Band[] {
   const zones = walkers.flatMap(w => {
     let zone: Zone | undefined
@@ -1056,8 +1195,7 @@ function bandsOf(zones: Zone[]): Band[] {
   })
 }
 
-// A card beside a zone `left` columns in and `span` wide, on whichever side
-// has more room, narrower when neither has room for the whole card.
+// A card beside a zone on the roomier side, narrower when neither fits it.
 function beside(left: number, span: number, columns: number): { isRight: boolean; width: number } {
   const toRight = columns - left - span - 1
   const toLeft = left - 1
@@ -1065,8 +1203,7 @@ function beside(left: number, span: number, columns: number): { isRight: boolean
   return { isRight, width: Math.max(16, Math.min(30, isRight ? toRight : toLeft)) }
 }
 
-// The zones on the desktop, laid out in fractions of the picture, so they
-// sit on the sprites however tall the pane's rows come out.
+// Desktop zones in fractions of the picture, so they sit on the sprites at any row height.
 function houseHoverLayer(ui: Pick<Elements['desktop'], 'Box' | 'Svg'>, bands: Band[], now: number, grid: HouseGrid, columns: number) {
   const { Box, Svg } = ui
   if (bands.length === 0) return null
@@ -1098,8 +1235,7 @@ function houseHoverLayer(ui: Pick<Elements['desktop'], 'Box' | 'Svg'>, bands: Ba
   return <Box position="absolute" top={0} left={0} width="100%" height="100%" flexDirection="column">{rows}</Box>
 }
 
-// The zones in the terminal, over the plan's cells, the plan `inset`
-// columns in a pane `columns` wide and `rows` of it tall.
+// Terminal zones over the plan's cells, `inset` columns in.
 function planHoverCells(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, bands: Band[], now: number, inset: number, columns: number, rows: number) {
   const { Box } = ui
   let floor = 0
@@ -1126,8 +1262,7 @@ function planHoverCells(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, bands: B
   })
 }
 
-// A hover card over the terminal's house: the title in `color`, the task,
-// the rest dim, in colours of its own, dark in either theme.
+// A terminal hover card: title in `color`, task bright, the rest dim, dark in either theme.
 const CARD_PAPER = '#16181d'
 const CARD_INK = '#e8e8f0'
 const CARD_DIM = '#8c96a0'
@@ -1141,10 +1276,8 @@ function cardOf(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, lines: string[],
   )
 }
 
-// Opens the house. `afresh`, as the person's own asks are: one already open,
-// showing or not, is closed and opened again, since on the desktop a pane
-// opened again while open, or kept across a reload of the plugin, can stay
-// blank; else one already open is left be.
+// With `afresh` (the person's own asks) an open pane is reopened, as on the desktop one reopened while
+// open, or kept across a plugin reload, can stay blank.
 async function openPane($: EngineInterface, afresh = false): Promise<void> {
   const panes = await $.ui.panes().catch(() => [])
   if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
@@ -1179,8 +1312,7 @@ const DEMO_LIFETIME = 5 * 60 * 1000
 let demoTimer: { cancel: () => void } | undefined
 let demoEnd: ReturnType<EngineInterface['clock']['after']> | undefined
 let demoTick = 0
-// when the demo shipped each of its boxes, kept apart from real work's and
-// gone with it
+// the demo's shipping times, apart from real work's and gone with the demo
 let demoBoxes: number[] = []
 
 function demoMember(i: number, now: number, room: Room): Resident {
@@ -1193,8 +1325,7 @@ function demoMember(i: number, now: number, room: Room): Resident {
   }
 }
 
-// Every few seconds one demo agent moves on to its next step; now and then
-// one finishes and ships its box, and a new one is handed a job.
+// Each tick a demo agent steps on; at times one finishes and a new one joins.
 async function demoStep($: EngineInterface): Promise<void> {
   demoTick++
   const now = await $.clock.now()
@@ -1253,16 +1384,16 @@ async function stopDemo($: EngineInterface): Promise<void> {
 
 // ---------- /haus snapshot: the house as an animated SVG file ----------
 
-// Into the session's folder, over the last one.
+// This session's household only, as the file may be shared; in the pane's colours, so with other sessions
+// open its members keep their rings. A fixed path the directory can read, in the folder Claude Code runs in.
 async function snapshot($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
-  const list = ordered(await read($, residents))
+  const list = ordered(await read($, residents)).filter(c => !c.session)
   const source = svg(list, await yardBoxes($, now), now, metersOf(await read($, plan)))
   await $.fs.write('vibehaus-snapshot.svg', source)
 }
 
-// The band's ◧ Vibehaus button: opens the house, or closes it when it is
-// showing.
+// The band's ◧ Vibehaus button.
 async function togglePane($: EngineInterface): Promise<void> {
   try {
     const isShowing = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)
@@ -1276,31 +1407,25 @@ async function togglePane($: EngineInterface): Promise<void> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'haus',
-      description: 'Show Vibehaus · "demo" fills it with a demo household · "snapshot" saves it as an SVG',
-      argumentHint: '[demo | snapshot]',
-      immediate: true,
-    })
-    const usage = await leadUsage($)
-    await change($, list => list.filter(c => !c.isDemo).map(c => (c.id === MAIN && usage ? { ...c, usage } : c)))
-    for (const c of await read($, residents)) if (c.carrying && !c.session) await sendOut($, c.id)
-    void endQuietly($).catch(() => undefined)
-    $.clock.after(ENDING_GRACE, () => void endQuietly($).catch(() => undefined))
-    void startSharing($).catch(() => undefined)
+    await begin($)
     void openPane($).catch(() => undefined)
-    void refreshPlan($).catch(() => undefined)
-    void pruneStore($).catch(() => undefined)
+    ticker?.cancel()
+    ticker = $.clock.every(MINUTE, () => void tickPlan($).catch(() => undefined))
 
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
-  // a session ending moves its household out of every other house
+  // a session ending moves its household out of every house and takes the demo along
   on('session.end', async ($, e, next) => {
     await stopSharing($)
+    await update($, residents, list => list.filter(c => !c.isDemo)).catch(() => undefined)
+    demoTimer?.cancel()
+    demoTimer = undefined
+    cancelEnd()
+    demoBoxes = []
 
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
   on('command.run', { command: 'haus' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
@@ -1315,7 +1440,7 @@ export const register: Register = on => {
     }
     if (arg === 'snapshot') {
       await snapshot($)
-      return { text: 'Saved the house to vibehaus-snapshot.svg in this session\'s folder. It is an animated SVG, so open it in a browser.' }
+      return { text: 'Saved the house to vibehaus-snapshot.svg in the folder Claude Code runs in. It is an animated SVG, so open it in a browser.' }
     }
     if (arg) return { text: 'Usage: /haus, /haus demo or /haus snapshot.' }
     await openPane($, true)
@@ -1323,50 +1448,65 @@ export const register: Register = on => {
     return { text: 'Vibehaus opened.' }
   })
 
-  // The band right above the prompt: how much of the plan is used, its
-  // "vibe fatigue", and the ◧ Vibehaus button opening or closing the house.
-  // It gives way to a survey.
+  // The band above the prompt: plan use ("vibe fatigue") and the house toggle, giving way to a survey.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
-    const meters = metersOf(await read($, plan))
+    // drawn again each minute, so the reset times count down
+    await read($, minute)
+    const now = await $.clock.now()
+    const meters = metersOf(current(await read($, plan), now))
+    const { bar, words } = bandOf(meters, e.props.bodyColumns, now)
 
+    // monospaced, as the meters' cells were counted in it
     return (
       <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
         <Box flexDirection="row" alignItems="center" columnGap={2} flexShrink={1}>
-          <Text dimColor>Vibe fatigue</Text>
-          {meters.map(m => {
-            const filled = m.percent === undefined ? 0 : Math.round((Math.min(100, m.percent) / 100) * BAR)
+          {meters.map((m, i) => {
+            const filled = m.percent === undefined ? 0 : Math.round((Math.max(0, Math.min(100, m.percent)) / 100) * bar)
             const color = m.percent === undefined ? undefined : meterColor(m)
             return (
-              <Text>
-                <Text dimColor>{`${m.label.toLowerCase()} `}</Text>
+              <Text mono>
+                <Text dimColor>{`${m.label} `}</Text>
                 <Text color={color}>{'━'.repeat(filled)}</Text>
-                <Text color="#3a3f47">{'━'.repeat(BAR - filled)}</Text>
-                <Text dimColor> {m.percent === undefined ? '--' : `${Math.round(m.percent)}%`}</Text>
+                <Text color="#3a3f47">{'━'.repeat(bar - filled)}</Text>
+                <Text dimColor> {percentText(m)}{words[i] ? ` · ${words[i]}` : ''}</Text>
               </Text>
             )
           })}
         </Box>
-        <Button key="vibehaus-toggle" label="◧ Vibehaus" plain dimColor onPress={() => void togglePane($)} />
+        <Button key="vibehaus-toggle" label={TOGGLE} plain dimColor onPress={() => void togglePane($)} />
       </Box>
     )
-  })
+  }).catch((_, e, next) => next(e))
 
-  // Every model request, the lead's and each subagent's, adds its tokens to
-  // that member's usage.
+  // After a turn, or a plan window moving a point: new readings go to the band and the store.
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits')) {
+      const now = await $.clock.now()
+      void takeReading($, readingOf(e.rateLimits, now), now).catch(() => undefined)
+    }
+
+    return next(e)
+  }).catch((_, e, next) => next(e))
+
   on('turn.step', async function* ($, e, next) {
     const response = yield* next(e)
     void recordUsage($, e.agentId ?? MAIN, tokensOf(response.usage)).catch(() => undefined)
 
     return response
-  })
+  }).catch(async function* (_, e, next) { return yield* next(e) })
 
   on('turn.start', async ($, e, next) => {
+    // a subagent or teammate is at work already, unless a teammate woken by a message
+    if (e.agentId) {
+      await move($, e.agentId, c => (c.isTeammate && c.status === 'idle' ? { status: 'working', activity: 'Thinking' } : {})).catch(() => undefined)
+      return next(e)
+    }
     await move($, MAIN, { status: 'working', room: 'study', activity: 'Thinking', tool: undefined, waitingTool: undefined })
 
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
   on('tool.call', async ($, e, next) => {
     // only the model's own calls are household work, not a plugin's
@@ -1376,8 +1516,7 @@ export const register: Register = on => {
     const activity = activityOf(tool, e)
     let stranger: Resident | undefined
     if (e.agentId && !(await read($, residents)).some(c => c.id === e.agentId)) {
-      // an agent we never saw start: household only if the engine lists it, so its
-      // own forks (compaction, memory) never show up as phantom agents
+      // an agent never seen starting joins only if listed, so engine forks (compaction, memory) stay out
       const info = (await $.agent.list().catch(() => [])).find(a => a.id === e.agentId)
       if (!info) return next(e)
       const now = await $.clock.now()
@@ -1387,15 +1526,14 @@ export const register: Register = on => {
         ...(info.teammateId ? { isTeammate: true } : {}),
       }
     }
+    // awaited before the call goes on: a permission prompt's amber tag needs the member at work
     const startedAt = await $.clock.now()
     await move($, id, c => ({
       status: 'working', room: roomFor(tool), activity, tool,
       calls: [...(c.calls ?? []), startedAt].slice(-MAX_CALLS),
     }), stranger)
 
-    // Back from the call, or from a prompt it never got past: nobody is left
-    // waiting, a member finished meanwhile stays finished, and the room's
-    // machine flashes with the result.
+    // After the call, or a prompt it never got past: nobody stays waiting, and the room's machine flashes.
     const settleCall = async (isOk: boolean) => {
       const now = await $.clock.now()
       const context = id === MAIN ? await contextNow($) : undefined
@@ -1445,28 +1583,29 @@ export const register: Register = on => {
     }
 
     return ran
-  })
+  }).catch((_, e, next) => next(e))
 
-  // The session's title, as the sidebar shows it, names its household.
+  // The sidebar title names the session's household.
   on('classic.SessionStart', async ($, e, next) => {
     void retitle($, e.session_title).catch(() => undefined)
+    // a /clear or a resume goes on in this process, with no session.start
+    if (e.source === 'clear' || e.source === 'resume') void begin($).catch(() => undefined)
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     void retitle($, e.session_title).catch(() => undefined)
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
-  // At the end of every turn the engine hands over its own list of background
-  // work in flight: the house is synced to it, so nothing is missed or stuck.
+  // Each turn ends with the engine's background list; syncing to it leaves nothing missed or stuck.
   on('classic.Stop', async ($, e, next) => {
     const asOf = await $.clock.now()
     const answer = await next(e)
     await reconcile($, e.background_tasks, asOf).catch(() => undefined)
 
     return answer
-  })
+  }).catch((_, e, next) => next(e))
 
   on('classic.SubagentStop', async ($, e, next) => {
     const asOf = await $.clock.now()
@@ -1474,29 +1613,26 @@ export const register: Register = on => {
     await reconcile($, e.background_tasks, asOf).catch(() => undefined)
 
     return answer
-  })
+  }).catch((_, e, next) => next(e))
 
-  // A permission prompt, as Claude Code announces it: the agent asking turns
-  // to you under an amber tag until the call goes on or is refused.
+  // A permission prompt: the asker turns to you under an amber tag until the call goes on or is refused.
   on('classic.Notification', async ($, e, next) => {
     if (e.notification_type === 'permission_prompt') await askFor($, e.agent_id, e.message).catch(() => undefined)
 
     return next(e)
-  })
+  }).catch((_, e, next) => next(e))
 
   on('agent.spawn', async ($, e, next) => {
     const spawned = await next(e)
     if (spawned.agentId) {
       const now = await $.clock.now()
-      const lead = (await read($, residents)).find(c => c.id === (e.parentAgentId ?? MAIN))
-      await join($, {
-        id: spawned.agentId,
+      const list = await read($, residents)
+      const lead = list.find(c => c.id === (e.parentAgentId ?? MAIN))
+      // its first tool call may have come first and put it at work already
+      const had = list.find(c => c.id === spawned.agentId)
+      const who = {
         name: oneLine(e.description || e.subagentType),
         kind: e.subagentType,
-        room: roomForKind(e.subagentType),
-        movedAt: now,
-        status: 'working',
-        activity: 'Starting up',
         spawnedAt: now,
         spawnRoom: lead?.room ?? 'study',
         taskType: 'subagent',
@@ -1504,11 +1640,14 @@ export const register: Register = on => {
         ...(e.background ? { isBackground: true } : {}),
         ...(e.workflow ? { isWorkflow: true } : {}),
         ...(e.isTeammate || spawned.teammateId ? { isTeammate: true } : {}),
+      }
+      await join($, had ? { ...had, ...who } : {
+        id: spawned.agentId, room: roomForKind(e.subagentType), movedAt: now, status: 'working', activity: 'Starting up', ...who,
       }).catch(() => undefined)
     }
 
     return spawned
-  })
+  }).catch((_, e, next) => next(e))
 
   // A background task's end arrives as a <task-notification> in a user row.
   on('session.append', async ($, e, next) => {
@@ -1523,12 +1662,15 @@ export const register: Register = on => {
     if (isNotice) {
       for (const m of text.matchAll(/<task-id>([^<]+)<\/task-id>[\s\S]*?<status>([^<]+)<\/status>/g)) {
         const [, taskId, status] = m
-        if (taskId && status) await finish($, taskId.trim(), ended(status.trim()))
+        if (!taskId || !status) continue
+        await finish($, taskId.trim(), ended(status.trim()))
+        // taken as completed already: the notice says how it ended
+        await restate($, taskId.trim(), ended(status.trim()))
       }
     }
 
     return stored
-  })
+  }).catch((_, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
@@ -1548,37 +1690,37 @@ export const register: Register = on => {
         status: 'idle', activity: 'Waiting for you', tool: undefined, waitingTool: undefined,
         ...(context !== undefined ? { context } : {}),
       })
-      void refreshPlan($).catch(() => undefined)
     }
 
     return done
-  })
+  }).catch((_, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const everyone = ordered(await read($, residents))
     const now = await $.clock.now()
     const boxes = await yardBoxes($, now)
-    // a second on while anyone walks, so the hover zones keep up; more
-    // seldom while all stand still
+    // redraw sooner while anyone walks so hover zones keep up, less often when all stand still
     const redrawFor = (tracks: Track[]) => {
       const isStill = tracks.every(t => {
         const [a, b] = [spotOf(t, now), spotOf(t, now + QUIET_MS)]
         const moved = (p?: { x: number; y: number }, q?: { x: number; y: number }) => (p && q ? Math.hypot(p.x - q.x, p.y - q.y) > 0.5 : p !== q)
-        return !moved(a, b) && Array.from({ length: 8 }, (_, i) => spotOf(t, now + ((i + 1) * QUIET_MS) / 9)).every(p => !moved(a, p))
+        return !moved(a, b) && Array.from({ length: 8 }, (_k, i) => spotOf(t, now + ((i + 1) * QUIET_MS) / 9)).every(p => !moved(a, p))
       })
       redrawSoon($, isStill ? QUIET_MS : REFRESH_MS)
     }
 
     if (e.surface === 'terminal') {
       const { Box, Text, Raster } = $.ui.resolve(e)
-      const cols = Math.max(16, e.props.bodyColumns)
-      const bodyRows = Math.max(16, e.props.scroll.bodyRows)
+      const sized = (n: number, or: number) => (Number.isFinite(n) ? Math.max(16, n) : or)
+      const cols = sized(e.props.bodyColumns, 80)
+      // the most rows the pane may take: docked, all of it; inline above the prompt, a modest plan
+      const bodyRows = Math.min(sized(e.props.scroll.bodyRows, 40), e.props.placement === 'inline' ? INLINE_ROWS : Infinity)
       const tracks = houseTracks(everyone, now)
       redrawFor(tracks)
-      // The house's floor plan as big as the pane takes, its agents walking
-      // it a frame at a time.
       const size = planSize(cols, bodyRows)
       const plan = planOf(size, boxes.length, everyone)
+      // narrower than the narrowest plan: say so, rather than spill over
+      if (plan.columns > cols) return <Text dimColor wrap="wrap">Vibehaus needs a pane {plan.columns} columns wide.</Text>
       const byId = new Map(everyone.map(c => [c.id, c]))
       const walkers = tracks.flatMap(t => {
         const c = byId.get(t.id)
@@ -1589,18 +1731,17 @@ export const register: Register = on => {
       shownCells = cells
       playHouse($)
       const inset = Math.max(0, Math.floor((cols - plan.columns) / 2))
-      // the plan in the pane's middle, garden in the rows it leaves above
-      // and below
+      // the plan centred, garden in the rows it leaves above and below
       const spare = Math.max(0, bodyRows - plan.rows)
-      const above = Math.floor(spare / 2)
-      const below = spare - above
+      const above = Math.min(RASTER_ROWS, Math.floor(spare / 2))
+      const below = Math.min(RASTER_ROWS, spare - Math.floor(spare / 2))
       const band = (key: string, rows: number, side: 'above' | 'below') => (
         <Box marginLeft={inset}>
           <Raster key={key} columns={plan.columns} rows={rows} cells={gardenRaster(plan.columns, rows, side)} />
         </Box>
       )
       return (
-        <Box flexDirection="column" width={cols} height={plan.rows + spare}>
+        <Box flexDirection="column" width={cols} height={plan.rows + above + below}>
           {above > 0 && band('vh-garden-above', above, 'above')}
           <Box flexDirection="row" height={plan.rows}>
             <Box marginLeft={inset}>
@@ -1613,9 +1754,7 @@ export const register: Register = on => {
       )
     }
 
-    // the picture's description: who, the task, and what each is doing or
-    // how it ended; a visitor on its way out is drawn walking off, but no
-    // longer counted
+    // alt text: who, the task, what each does or how it ended; a visitor walking off is not counted
     const list = everyone.filter(c => c.leaving === undefined)
     const meters = metersOf(await read($, plan))
     const working = list.filter(c => c.status === 'working').length
@@ -1636,11 +1775,8 @@ export const register: Register = on => {
       const sized = (n: number, or: number) => (Number.isFinite(n) && n >= 1 ? n : or)
       const cols = sized(e.props.bodyColumns, 80)
       const bodyRows = sized(e.props.scroll.bodyRows, 40)
-      // The tall picture in the pane's middle, the pane clipping its garden
-      // evenly above and below; narrowed, centred, when the pane is too short
-      // for the house's own stretch of it, to a whole percentage (all a Box
-      // takes). The body takes its height from the tree: neither a percentage
-      // nor a picture laid over it gives it one.
+      // Centred, narrowed to a whole percentage (all a Box takes) when the pane is too short for the house.
+      // The body's height must come from the tree: no percentage or overlaid picture gives it one.
       const room = (grid.w * (bodyRows - 0.1) * ROW_RATIO) / cols
       const width = Math.max(1, Math.min(100, Math.floor((room / houseGrid().h) * 100)))
       return (
@@ -1652,16 +1788,16 @@ export const register: Register = on => {
                 <Svg source={layer} alt={i === 0 ? alt : 'The agents in the house'} />
               </Box>
             ))}
-            {houseHoverLayer({ Box, Svg }, houseBands(everyone, tracks, now, grid), now, grid, cols)}
+            {houseHoverLayer({ Box, Svg }, houseBands(everyone, tracks, now, grid), now, grid, Math.max(1, (cols * width) / 100))}
           </Box>
         </Box>
       )
     }
 
-    // elsewhere, the pictures as one, with as many agents as fit, and the
-    // plan bars in the corner, there being no band
+    // elsewhere, one picture with as many agents as fit and the plan bars, there being no band
     const { Svg } = $.ui.resolve(e)
-    redrawFor(houseTracks(everyone, now))
-    return <Svg source={svg(everyone, boxes, now, meters, SVG_LIMIT)} alt={alt} />
+    const one = onePicture(everyone, boxes, now, meters, SVG_LIMIT)
+    redrawFor(one.tracks)
+    return <Svg source={one.source} alt={alt} />
   })
 }

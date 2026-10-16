@@ -3,6 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Resident } from '../vibehaus/types'
 import { doorX, doorY, frontDoor, T } from '../vibehaus/hooks/house'
 import { arrive, errandEnds, houseTracks, LAYOUT, reanchor, spotOf } from '../vibehaus/hooks/scene'
+import { visit } from '../vibehaus/hooks/visitors'
 import { yardOf } from '../vibehaus/hooks/yard'
 
 const PANE_PROPS = {
@@ -21,8 +22,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
   const cells = Object.values(L.rooms)
   const door = frontDoor(L)
   const road = yardOf(L).road
-  // where a step from p to q goes through a wall, other than by its doorway
-  // or the front door, or off the floor and the road out front
+  // where a step from p to q crosses a wall away from a doorway or the front door, or leaves floor and road
   const through = (p: { x: number; y: number }, q: { x: number; y: number }): string | undefined => {
     const fy = L.ph - T / 2
     if ((p.y - fy) * (q.y - fy) < 0) {
@@ -60,9 +60,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
     let n = 0
     for (let step = 0; step < 120; step++) {
       now += Math.floor(300 + rnd() * (rnd() < 0.2 ? 20000 : 4000))
-      // walks that ended, as the hooks see to: couriers back from the pallets
-      // and visitors in from the street go about their day, and visitors
-      // gone down the road leave
+      // end walks as the hooks do: returned couriers and arrived visitors carry on, departed visitors leave
       const ends = errandEnds(list, now)
       const over = (c: Resident) => (ends.get(c.id) ?? Infinity) <= now
       if (list.some(over)) {
@@ -97,7 +95,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
       else if (roll < 0.3 && main.status !== 'idle') next = set('main', { room: rooms[Math.floor(rnd() * rooms.length)] })
       else if (roll < 0.42 && list.length < 10) next = [...list, member(`a${n++}`, { status: 'working', room: rnd() < 0.5 ? 'library' : 'study', spawnedAt: now, spawnRoom: main.room })]
       else if (roll < 0.52 && guests.length < 4) {
-        // another session's members move in, together a moment apart
+        // another session's members move in, a moment apart
         const room = rooms[Math.floor(rnd() * rooms.length)] ?? 'study'
         const guest = (k: number) => arrive(member(`other/g${n++}`, rnd() < 0.5
           ? { status: 'working', room, session: 'other' }
@@ -112,7 +110,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
         next = set(who.id, { status: 'done', doneAt: now, carrying: true, box: boxes.length })
         boxes.push(who.session ?? '')
       } else continue
-      // the finished leave once there are more than four, once their box is out
+      // past four finished with their box out, the oldest leaves
       const done = next.filter(c => c.status === 'done' && !c.carrying && !c.session).sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
       if (done.length > 4) next = next.filter(c => c !== done[0])
 
@@ -120,7 +118,7 @@ test('nobody walks through a wall or jumps, whatever the household gets up to', 
       list = reanchor(list, next, now)
       tracks = houseTracks(list, now)
       for (const t of tracks) {
-        // where it stands now is where it stood a moment ago
+        // it stands where it stood a moment ago
         const was = shown.get(t.id)
         const is = spotOf(t, now)
         if (was && is && Math.hypot(was.x - is.x, was.y - is.y) > 0.5) problems.push(`${t.id} jumped at step ${step}`)
@@ -146,7 +144,7 @@ test('a visitor comes in from the street by the front door and leaves the same w
   const lead: Resident = { id: 'main', name: 'Lead', kind: 'main', room: 'study', movedAt: 0, status: 'idle', activity: 'x', idleSince: now - 60000 }
   const guest = arrive({ id: 'other/ag1', name: 'Map it', kind: 'Explore', room: 'library', movedAt: 0, status: 'working', activity: 'Grep', session: 'other' }, now, 1.5)
   let list = [lead, guest]
-  // where the house shows it at `t`, on the plan; nowhere while out of sight
+  // where the house shows it at `t` on the plan; nowhere out of sight
   const where = (t: number) => {
     const track = houseTracks(list, t).find(k => k.id === guest.id)
     const p = track && spotOf(track, t)
@@ -175,7 +173,7 @@ test('a redraw seconds later is drawn on the clock, not reused', async ($, on) =
     await desk.unmount()
     return pics.find(p => p.props.alt.startsWith('Vibehaus'))?.props.source ?? ''
   }
-  // a crown's sway: its beat, and how far into it the picture starts
+  // a crown's sway: its beat, and the picture's start within it
   const sway = (source: string) => {
     const m = /type="skewX" values="[^"]*" dur="([\d.]+)s" begin="-([\d.]+)s"/.exec(source)
     return { beat: Number(m?.[1]), at: Number(m?.[2]) }
@@ -185,10 +183,36 @@ test('a redraw seconds later is drawn on the clock, not reused', async ($, on) =
   const later = await picture()
 
   expect(later).not.toBe(first)
-  // the later picture picks the sway up 3.7 seconds on, as the first one,
-  // left showing, would have it
+  // the later picture picks the sway up 3.7 s on, where the first would be
   const a = sway(first)
   const b = sway(later)
   expect(a.beat).toBe(b.beat)
   expect(Math.abs(((b.at - a.at + a.beat) % a.beat) - (3.7 % a.beat))).toBeLessThan(0.02)
+})
+
+test('every house sends another session\'s visitors up and down the road at the moments the store says', () => {
+  const now = 1_800_000_000_000
+  const member = (id: string, extra: Partial<Resident>): Resident => ({ id, name: id, kind: 'Explore', room: 'library', movedAt: 0, status: 'working', activity: 'Grep', ...extra })
+  const theirs = {
+    id: 's2', since: now - 60 * 60 * 1000,
+    residents: [member('main', { kind: 'main', room: 'study' }), member('ag1', { spawnedAt: now - 2000 }), member('ag2', { spawnedAt: now - 2000 })],
+  }
+  // two houses reading the store a second apart
+  const a = visit([], [theirs], now)
+  const b = visit([], [theirs], now + 1000)
+  const of = (list: Resident[], id: string) => list.find(c => c.id === id)
+  // the lead, there since its session began, has no walk to show
+  expect(of(a, 's2/main')?.arriving).toBeUndefined()
+  expect(of(b, 's2/main')?.arriving).toBeUndefined()
+  // the two that came together set off a moment apart, the same in both houses
+  expect(of(a, 's2/ag1')?.arriving).toBe(now - 2000)
+  expect(of(a, 's2/ag2')?.arriving).toBe(now - 500)
+  expect(of(b, 's2/ag1')?.arriving).toBe(now - 2000)
+  expect(of(b, 's2/ag2')?.arriving).toBe(now - 500)
+
+  // let go, it walks out from where it stands when the house hears, never jumping back
+  const later = { ...theirs, residents: theirs.residents.filter(c => c.id !== 'ag1') }
+  const a2 = visit(a, [later], now + 5000)
+  expect(of(a2, 's2/ag1')?.leaving).toBe(now + 5000)
+  expect(of(reanchor(a, a2, now + 5000), 's2/ag1')?.anchor?.t).toBe(now + 5000)
 })

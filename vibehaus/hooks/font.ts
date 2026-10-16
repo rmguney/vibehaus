@@ -1,9 +1,6 @@
 /*
- * Vibehaus's own pixel font: capitals and digits on a 5x7 grid, lowercase
- * with a 5-row x-height, ascenders and two rows of descenders, all drawn as
- * SVG rectangles on the same pixel grid as the art, so text stays crisp at
- * any size the picture is shown at. Letters have their own widths; each is
- * followed by one blank column.
+ * Vibehaus's pixel font, 5x7 with descenders, as SVG rectangles on the art's pixel grid so text stays
+ * crisp at any size. Widths vary; a blank column follows each letter.
  */
 
 const GLYPHS: Record<string, string[]> = {
@@ -111,16 +108,14 @@ GLYPHS[String.fromCharCode(92)] = ['#....', '#....', '.#...', '..#..', '...#.', 
 
 const UNKNOWN = ['#####', '#...#', '#...#', '#...#', '#...#', '#...#', '#####']
 
-// Accented letters lose their marks, a dotless i and the like become their
-// plain forms, and long dashes and curly quotes their plain ones too.
+// Accents dropped; dotless i, ß, long dashes and curly quotes made plain.
 const FOLD: Record<string, string> = { 'ı': 'i', 'İ': 'I', 'ß': 'ss' }
 for (const [code, plain] of [[0x2014, '-'], [0x2013, '-'], [0x201c, '"'], [0x201d, '"'], [0x2018, "'"], [0x2019, "'"]] as const) {
   FOLD[String.fromCharCode(code)] = plain
 }
 const MARKS = new RegExp(`[${String.fromCharCode(0x300)}-${String.fromCharCode(0x36f)}]`, 'g')
 
-// joiners, variation selectors and skin tones, which only shape the emoji
-// beside them
+// joiners, variation selectors and skin tones, which only shape the emoji beside them
 const SHAPERS = /[\u200d\ufe0e\ufe0f]|\ud83c[\udffb-\udfff]/g
 
 function normalize(text: string): string[] {
@@ -131,14 +126,14 @@ const glyphOf = (ch: string): string[] => GLYPHS[ch] ?? (/\s/.test(ch) ? (GLYPHS
 
 const widthOf = (g: string[]) => g[0]?.length ?? 5
 
-// How wide `text` runs at `px` units a pixel.
+// Width of `text` at `px` units a pixel.
 export function textWidth(text: string, px: number): number {
   const chars = normalize(text)
   if (chars.length === 0) return 0
   return (chars.reduce((n, ch) => n + widthOf(glyphOf(ch)) + 1, 0) - 1) * px
 }
 
-// Cuts `text` to fit `maxWidth`, ending in "…" when it had to cut.
+// Cuts `text` to `maxWidth`, ending in "…" when cut.
 export function fitText(text: string, maxWidth: number, px: number): string {
   if (textWidth(text, px) <= maxWidth) return text
   const chars = normalize(text)
@@ -150,11 +145,10 @@ export function fitText(text: string, maxWidth: number, px: number): string {
   return `${out.trimEnd()}…`
 }
 
-// Breaks `text` into lines that fit `maxWidth`, at spaces where it can; a
-// word too long for a line is cut. At most `maxLines`, the last one ending in
-// "…" when text was left over.
+// Wraps at spaces, cutting overlong words; at most `maxLines`, the last ending in "…" if text is left.
 export function wrapText(text: string, maxWidth: number, px: number, maxLines: number): string[] {
   const lines: string[] = []
+  // by code points, so an emoji is never split
   let rest = text.trim()
   while (rest.length > 0 && lines.length < maxLines) {
     if (textWidth(rest, px) <= maxWidth) {
@@ -162,15 +156,16 @@ export function wrapText(text: string, maxWidth: number, px: number, maxLines: n
       rest = ''
       break
     }
+    const chars = [...rest]
     let cut = 0
-    for (let i = 1; i <= rest.length; i++) {
-      if (textWidth(rest.slice(0, i), px) > maxWidth) break
+    for (let i = 1; i <= chars.length; i++) {
+      if (textWidth(chars.slice(0, i).join(''), px) > maxWidth) break
       cut = i
     }
-    const space = rest.lastIndexOf(' ', cut)
+    const space = chars.lastIndexOf(' ', cut)
     const end = space > 0 ? space : Math.max(1, cut)
-    lines.push(rest.slice(0, end).trimEnd())
-    rest = rest.slice(end).trimStart()
+    lines.push(chars.slice(0, end).join('').trimEnd())
+    rest = chars.slice(end).join('').trimStart()
   }
   if (rest.length > 0 && lines.length > 0) {
     lines[lines.length - 1] = fitText(`${lines[lines.length - 1]} ${rest}`, maxWidth, px)
@@ -182,8 +177,7 @@ const r2 = (n: number) => Math.round(n * 100) / 100
 
 type Rect = [x: number, y: number, w: number, h: number]
 
-// A bitmap's lit pixels as few rectangles: each run across a row grows down
-// while the rows below light the same span, so strokes cost one rectangle.
+// Lit pixels as few rectangles: each run in a row grows down while rows below match it.
 function rectsOf(rows: string[]): Rect[] {
   const used = rows.map(row => [...row].map(() => false))
   const lit = (x: number, y: number) => rows[y]?.[x] === '#' && used[y]?.[x] === false
@@ -204,19 +198,21 @@ function rectsOf(rows: string[]): Rect[] {
 
 const glyphRects = new Map<string, Rect[]>()
 
+// by letter; letters the font lacks share one box, so the map never outgrows the font
 function rectsOfChar(ch: string): Rect[] {
-  const known = glyphRects.get(ch)
+  const glyph = glyphOf(ch)
+  const key = glyph === UNKNOWN ? '' : ch
+  const known = glyphRects.get(key)
   if (known) return known
-  const rects = rectsOf(glyphOf(ch))
-  glyphRects.set(ch, rects)
+  const rects = rectsOf(glyph)
+  glyphRects.set(key, rects)
   return rects
 }
 
 const pathOf = (rects: Rect[], dx = 0, dy = 0) =>
   rects.map(([x, y, w, h]) => `M${x + dx} ${y + dy}h${w}v${h}h${-w}z`).join('')
 
-// The outline of `text` in whole font pixels from its top-left corner. Kept,
-// since names repeat.
+// Outlines in font pixels from the top-left, kept since names repeat.
 const outlines = new Map<string, string>()
 
 function outline(text: string): string {
@@ -233,9 +229,7 @@ function outline(text: string): string {
   return d
 }
 
-// `text` as one path, its top-left corner (the top of its capitals) at
-// (x, y); `anchor` places it by its start, middle or end, as text-anchor would.
-// `cls` names a class the picture's style recolours in the light theme.
+// One path, its capitals' top at (x, y), `anchor` as text-anchor; `cls` a class the light theme recolours.
 export function pixelText(
   text: string, x: number, y: number,
   { px = 0.5, color, anchor = 'start', cls }: { px?: number; color: string; anchor?: 'start' | 'middle' | 'end'; cls?: string },
@@ -247,10 +241,7 @@ export function pixelText(
   return `<path${cls ? ` class="${cls}"` : ''} transform="translate(${r2(left)} ${r2(y)}) scale(${Math.round(px * 1000) / 1000})" fill="${color}" d="${d}"/>`
 }
 
-// `text` placed as pixelText places it, but as copies of each glyph: the
-// glyph's outline handed once to `define`, by an id of its own, and every
-// use of it a reference; far shorter than an outline apiece once letters
-// repeat, as they do across a card or a householdful of names.
+// As pixelText, but each glyph defined once through `define` and reused: far shorter once letters repeat.
 export function glyphText(
   text: string, x: number, y: number,
   { px = 0.5, color, anchor = 'start', cls }: { px?: number; color: string; anchor?: 'start' | 'middle' | 'end'; cls?: string },

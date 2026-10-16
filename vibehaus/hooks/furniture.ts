@@ -1,10 +1,6 @@
 /*
- * The furniture of each room, built of boxes on the plan: desks with their
- * monitors along the back of every work room, and each room's own pieces:
- * bookshelves and a lamp in the library, a fireplace and a reading armchair
- * in the study, a telescope and a radio in the sunroom, a fridge, a stove and
- * a coffee machine in the kitchen, a workbench in the workshop, and beds, a
- * TV and a couch in the bedroom lounge. Flames, screens and steam move.
+ * Each room's furniture, built of boxes on the plan: desks with monitors along the back of every work
+ * room, then each room's own pieces. Flames, screens and steam move.
  */
 import type { Room } from '../types'
 import { box, faceX, faceY, at } from './house'
@@ -43,12 +39,10 @@ const DESK_BODY: Record<Room, typeof F.wood> = {
   library: F.woodDark, study: F.wood, sunroom: F.pine, kitchen: F.white, workshop: F.pine, lounge: F.wood,
 }
 
-// Desk i of a work room: its back corner on the plan.
+// Desk i's back corner on the plan.
 export const deskAt = (c: Cell, i: number): { x: number; y: number } => ({ x: c.x + 2 + 14 * i, y: c.y + 1 })
 
-// A desk against the back wall, a monitor on it facing the room. Says where
-// the screen's top left corner is, for the screen's own drawing, slanted to
-// lie on the monitor's face, and where the desk's status light sits.
+// A desk and monitor on the back wall; returns where the screen (drawn separately) and light go.
 export function desk(cv: Canvas, L: Layout, room: Room, c: Cell, i: number): { screen: Pt; light: Pt } {
   const d = deskAt(c, i)
   const body = DESK_BODY[room]
@@ -79,12 +73,12 @@ function rug(cv: Canvas, L: Layout, x: number, y: number, w: number, d: number, 
   cv.layer()
 }
 
-// Something that flickers or glows, drawn as pixels with its own animation.
+// A pixel shape with its own animation, as a flame or a screen.
 function lit(pts: Pt[], fill: string, anim: string): string {
   return `<path fill="${fill}" d="${pathOf(pts)}">${anim}</path>`
 }
 
-// Steam curling up from a point, one wisp after another.
+// Steam rising from a point, wisp after wisp.
 function steam(p: Pt): string {
   return [0, 1].map(i => `<rect x="${Math.round(p.x) + i}" y="${Math.round(p.y)}" width="1" height="1" fill="#e8e8f0" opacity="0">` +
     `<animate attributeName="y" values="${Math.round(p.y)};${Math.round(p.y) - 6}" dur="2.4s" ${loopBegin(2.4, i * 1.2)} repeatCount="indefinite"/>` +
@@ -106,14 +100,14 @@ function library(cv: Canvas, L: Layout, c: Cell): void {
       }
     })
   }
-  // a reading lamp by the window
+  // reading lamp by the window
   box(cv, L, c.x + 33, c.y + 3, 1, 1, 12, F.brass)
   box(cv, L, c.x + 31.5, c.y + 1.5, 4, 4, 3, F.shade, 12)
   cv.layer()
 }
 
 function study(cv: Canvas, L: Layout, c: Cell): void {
-  // the fireplace and its chimney breast on the back wall
+  // fireplace and chimney breast on the back wall
   box(cv, L, c.x + 30, c.y, 8, 2, 25, F.brick)
   box(cv, L, c.x + 29, c.y, 10, 4, 11, F.brick)
   box(cv, L, c.x + 28.5, c.y, 11, 5, 1, F.woodDark, 11)
@@ -124,7 +118,7 @@ function study(cv: Canvas, L: Layout, c: Cell): void {
   const embers = lit([at(L, c.x + 33, c.y + 4, 1), at(L, c.x + 35, c.y + 4, 1), at(L, c.x + 34.5, c.y + 4, 3), at(L, c.x + 33.5, c.y + 4, 3)], '#fff1b0',
     `<animate attributeName="opacity" values="1;0.4;0.8;1" dur="0.6s" ${loopBegin(0.6)} repeatCount="indefinite"/>`)
   cv.raw(fire + embers)
-  // a reading armchair by the wall, turned to the fire, and a floor lamp
+  // floor lamp and armchair turned to the fire
   plant(cv, L, c.x + 2, c.y + 9, true)
   box(cv, L, c.x + 1, c.y + 26, 1, 1, 11, F.brass)
   box(cv, L, c.x - 0.5, c.y + 24.5, 4, 4, 3, F.shade, 11)
@@ -140,7 +134,7 @@ function study(cv: Canvas, L: Layout, c: Cell): void {
 }
 
 function sunroom(cv: Canvas, L: Layout, c: Cell): string {
-  // a telescope on its tripod, aimed at the window
+  // telescope on a tripod, aimed at the window
   const tx = c.x + 6
   const ty = c.y + 14
   box(cv, L, tx - 2, ty, 1, 1, 6, F.woodDark)
@@ -149,7 +143,7 @@ function sunroom(cv: Canvas, L: Layout, c: Cell): string {
   cv.layer()
   cv.poly([at(L, tx - 1, ty + 2, 8), at(L, tx + 4, ty - 3, 13), at(L, tx + 4, ty - 3, 11), at(L, tx - 1, ty + 2, 6)], F.brass.left)
   cv.layer()
-  // the radio on a side table
+  // radio on a side table
   box(cv, L, c.x + 1, c.y + 20, 5, 5, 5, F.wood)
   box(cv, L, c.x + 1.5, c.y + 21, 4, 3, 3, F.dark, 5)
   cv.layer()
@@ -166,7 +160,7 @@ function kitchen(cv: Canvas, L: Layout, c: Cell): string {
   box(cv, L, c.x, c.y + 15, 6, 12, 7, F.white)
   box(cv, L, c.x - 0.5, c.y + 15, 7, 12.5, 1, F.stone, 7)
   cv.layer()
-  // two burners, a pot on one, and a coffee machine at the end of the counter
+  // burners, a pot and a coffee machine
   for (const y of [c.y + 16.5, c.y + 20]) cv.poly([at(L, c.x + 1, y, 8), at(L, c.x + 4, y, 8), at(L, c.x + 4, y + 2.5, 8), at(L, c.x + 1, y + 2.5, 8)], HOLE)
   cv.layer()
   box(cv, L, c.x + 1, c.y + 16.5, 3, 2.5, 2, F.red, 8)
@@ -201,7 +195,7 @@ function lounge(cv: Canvas, L: Layout, c: Cell): void {
     box(cv, L, c.x + 1.8, y + 1.5, 2.6, 6, 1, F.linen, 5)
     cv.layer()
   }
-  // the TV on its stand, and the couch facing it
+  // TV on its stand, couch facing it
   box(cv, L, c.x + 18, c.y, 10, 4, 4, F.wood)
   box(cv, L, c.x + 19, c.y + 1, 8, 1, 7, F.dark, 4)
   cv.layer()
@@ -218,7 +212,7 @@ function lounge(cv: Canvas, L: Layout, c: Cell): void {
   plant(cv, L, c.x + 35, c.y + 35, true)
 }
 
-// A room's own furniture (not its desks), and any animated bits to lay over.
+// A room's own furniture (not desks); returns animated bits to lay over it.
 export function furniture(cv: Canvas, L: Layout, room: Room, c: Cell): string {
   switch (room) {
     case 'library': library(cv, L, c); return ''
@@ -230,8 +224,7 @@ export function furniture(cv: Canvas, L: Layout, room: Room, c: Cell): string {
   }
 }
 
-// Each work room's machine, which flashes as a tool call comes back: where,
-// on the picture, and how big.
+// Each work room's machine, which flashes as a tool call returns: its place and size.
 export function machine(L: Layout, room: Room, c: Cell): { at: Pt; w: number; h: number } | undefined {
   switch (room) {
     case 'library': return { at: at(L, c.x + 2.5, c.y + 17, 9), w: 14, h: 20 }

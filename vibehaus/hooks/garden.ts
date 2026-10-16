@@ -1,14 +1,7 @@
 /*
- * The garden: an autumn lawn filling the whole picture round the house, in
- * mottled grass strewn with tufts, fallen leaves and flowers, under oaks,
- * maples and birches in full colour, dark pines and shrubs: a few round the
- * house's corners, and copses and lone trees about the rest, with open lawn
- * between them, ponds big and small, flower beds, stones and toadstools.
- * Crowns sway in the wind and leaves come loose and drift down; by night
- * fireflies wander.
- *
- * All of it is drawn on the picture itself, not on the floor plan. The lawn
- * and what lies on it are a picture of their own, under the house's.
+ * The garden: an autumn lawn round the house with trees, ponds, beds, stones and toadstools. Crowns sway,
+ * leaves fall, fireflies wander by night. Drawn on the picture, not the floor plan, as its own picture
+ * under the house's.
  */
 import { TALL_WALL } from './house'
 import type { Layout } from './house'
@@ -52,8 +45,7 @@ const CROWNS: Record<Exclude<Kind, 'pine'>, [Mat, Mat, Mat, Mat]> = {
 const PINE = [mat('p1', '#142219', '#1f3a28'), mat('p2', '#1d3324', '#2e5a3a'), mat('p3', '#284a31', '#3f7a4c')]
 const LEAF = [mat('l1', '#b5541f', '#e8762a'), mat('l2', '#8f2a22', '#d23c2c'), mat('l3', '#b08a2a', '#f0b43a'), mat('l4', '#7a3a1a', '#b85a26')]
 
-// How each kind is built: trunk height, crown half-width and half-height,
-// and how far it leans in the wind, on its own beat.
+// Per kind: trunk height, crown half-sizes, lean in the wind and its beat.
 const BUILD: Record<Kind, { trunk: number; rx: number; ry: number; lean: number; beat: number }> = {
   oak: { trunk: 12, rx: 14, ry: 10, lean: 2.4, beat: 4.6 },
   maple: { trunk: 11, rx: 11, ry: 12, lean: 2.4, beat: 4.1 },
@@ -72,7 +64,7 @@ function blob(cv: Canvas, c: Pt, rx: number, ry: number, m: Mat | string): void 
   ], m)
 }
 
-// The four corners of the house's floor, on the picture.
+// The house floor's four corners on the picture.
 function corners(L: Layout) {
   return {
     top: { x: L.ox, y: L.oy },
@@ -118,8 +110,7 @@ function blades(cv: Canvas, r: () => number, x: number, y: number, n: number): v
   }
 }
 
-// A pond `rx` by `ry` about `at`, a ripple or two on it and a leaf or two
-// afloat.
+// A pond about `at`, with a ripple and a leaf or two.
 type Pond = { at: Pt; rx: number; ry: number }
 
 function pond(cv: Canvas, { at: p, rx, ry }: Pond): void {
@@ -139,10 +130,8 @@ function toadstool(cv: Canvas, p: Pt): void {
   cv.rect(p.x - 1, p.y - 2, 3, 1, G.cap)
 }
 
-// The lawn's patterns, each tile a different size so their repeats never
-// line up: the grass, mottled; patches of it a shade lighter or darker, a
-// tile the picture's width, each patch a few blobs run together, wrapped at
-// the tile's edges; tufts of longer grass; fallen leaves; small flowers.
+// Lawn patterns, tiles of different sizes so repeats never line up; patches span the picture's width,
+// wrapped at the edges.
 const PATCHES = { w: 248, h: 173 }
 // drawn once: the same for every picture
 let patchTile: Canvas | undefined
@@ -197,8 +186,7 @@ export function gardenPatterns(cv: Canvas): string {
       dots(G.dark, 'M7 10h1v1h-1zM9 11h1v1h-1zM44 34h1v1h-1zM29 21h1v1h-1zM31 20h1v1h-1zM52 7h1v1h-1zM17 39h1v1h-1zM19 40h1v1h-1zM38 45h1v1h-1z'))
 }
 
-// One kind's crown about the top of its trunk, (0, 0), swaying in the wind;
-// every tree of the kind sways on the same beat, as in one gust.
+// A kind's crown about (0, 0), the trunk top; trees of a kind sway on one beat, as in one gust.
 function crown(cv: Canvas, kind: Kind): string {
   const { rx, ry, lean, beat } = BUILD[kind]
   const c = { x: 0, y: -ry + (kind === 'bush' ? 1 : 3) }
@@ -221,7 +209,7 @@ function crown(cv: Canvas, kind: Kind): string {
     blob(cv, { x: c.x - rx * 0.3, y: c.y - ry * 0.45 }, rx * 0.45, ry * 0.4, l)
     blob(cv, { x: c.x + rx * 0.35, y: c.y - ry * 0.2 }, rx * 0.35, ry * 0.35, l)
     cv.layer()
-    const r = rng(kind.length * 31)
+    const r = rng([...kind].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) | 0, 7))
     for (let i = 0; i < (kind === 'bush' ? 4 : 9); i++) {
       cv.rect(Math.round(c.x - rx * 0.7 + r() * rx * 1.4), Math.round(c.y - ry * 0.7 + r() * ry * 1.3), 1, 1, f)
     }
@@ -229,12 +217,10 @@ function crown(cv: Canvas, kind: Kind): string {
   return `<animateTransform attributeName="transform" type="skewX" values="0;${lean};${(lean * 0.4).toFixed(1)};${(-lean * 0.5).toFixed(1)};0" dur="${beat}s" ${loopBegin(beat)} repeatCount="indefinite"/>`
 }
 
-// Where the trees stand, around the house's corners: `from` and `to` name
-// two corners of the house's floor, `u` how far along that edge, `dy` how far
-// above (behind the house) or below (in front of it) the edge.
+// The house's trees: `u` along the edge from floor corner `from` to `to`, `dy` above it (behind) or below.
 type Spot = { kind: Kind; from: 'top' | 'left' | 'right' | 'bottom'; to: 'top' | 'left' | 'right' | 'bottom'; u: number; dy: number }
 const TREES: Spot[] = [
-  // behind the house: over the back walls, left and right
+  // behind the house, over the back walls
   { kind: 'pine', from: 'left', to: 'top', u: 0.14, dy: -22 },
   { kind: 'oak', from: 'left', to: 'top', u: 0.36, dy: -26 },
   { kind: 'maple', from: 'left', to: 'top', u: 0.58, dy: -24 },
@@ -242,7 +228,7 @@ const TREES: Spot[] = [
   { kind: 'pine', from: 'top', to: 'right', u: 0.6, dy: -26 },
   { kind: 'oak', from: 'top', to: 'right', u: 0.8, dy: -22 },
   { kind: 'maple', from: 'top', to: 'right', u: 1.03, dy: -12 },
-  // in front of the house: the two gaps below its front edges
+  // in front, in the two gaps below the front edges
   { kind: 'maple', from: 'left', to: 'bottom', u: 0.03, dy: 26 },
   { kind: 'birch', from: 'left', to: 'bottom', u: 0.7, dy: 30 },
   { kind: 'bush', from: 'left', to: 'bottom', u: 0.56, dy: 4 },
@@ -252,7 +238,7 @@ const TREES: Spot[] = [
   { kind: 'pine', from: 'bottom', to: 'right', u: 0.8, dy: 38 },
 ]
 
-// Two lamp posts by the front of the house, lit by night.
+// Two lamp posts at the front, lit by night.
 export function lamps(cv: Canvas, L: Layout): string {
   let glow = ''
   for (const p of lampsAt(L)) {
@@ -271,39 +257,36 @@ function place(L: Layout, t: Spot): Pt {
   return lerp(c[t.from], c[t.to], t.u, t.dy)
 }
 
-// A tree on the lawn round the house.
+// One of the house's trees, in the house's picture.
 function tree(cv: Canvas, L: Layout, t: Spot): void {
-  treeAt(cv, t.kind, place(L, t))
+  treeAt(cv, t.kind, place(L, t), 'vh-h')
 }
 
-// A tree standing at `at`: a copy of its kind, drawn once whole (the trunk,
-// and the crown swaying on it), so each tree is one element.
-function treeAt(cv: Canvas, kind: Kind, at: Pt): void {
+// A tree at `at`, one element: a copy of its kind. `ns` keeps definitions apart where pictures are
+// laid into one.
+function treeAt(cv: Canvas, kind: Kind, at: Pt, ns: string): void {
   const b = BUILD[kind]
-  cv.define(`crown-${kind}`, sub => crown(sub, kind))
-  cv.define(`tree-${kind}`, sub => {
+  cv.define(`${ns}-crown-${kind}`, sub => crown(sub, kind))
+  cv.define(`${ns}-tree-${kind}`, sub => {
     if (b.trunk > 0) {
       sub.rect(-1, -b.trunk, 1, b.trunk, kind === 'birch' ? G.birch : G.trunk)
       sub.rect(0, -b.trunk, 1, b.trunk, kind === 'birch' ? G.trunk : G.bark)
     }
-    sub.raw(`<use href="#crown-${kind}" y="${-b.trunk}"/>`)
+    sub.raw(`<use href="#${ns}-crown-${kind}" y="${-b.trunk}"/>`)
   })
-  cv.raw(`<use href="#tree-${kind}" x="${at.x}" y="${at.y}"/>`)
+  cv.raw(`<use href="#${ns}-tree-${kind}" x="${at.x}" y="${at.y}"/>`)
 }
 
 export function treesBehind(cv: Canvas, L: Layout): void {
   for (const t of TREES) if (t.dy < 0) tree(cv, L, t)
 }
 
-// The trees in front of the house, each with how near it stands (the plan's
-// x + y, from where its trunk meets the lawn), to be drawn back to front
-// among the yard's things.
+// Front trees with their depth (the plan's x + y at the trunk), to sort among the yard's things.
 export function frontTrees(L: Layout): { depth: number; draw: (cv: Canvas) => void }[] {
   return TREES.filter(t => t.dy >= 0).map(t => ({ depth: 2 * (place(L, t).y - L.oy), draw: (cv: Canvas) => tree(cv, L, t) }))
 }
 
-// Whether a point of the picture lies over the house, its tall back walls
-// included, with a little room to spare.
+// Whether a point lies over the house, back walls included, with a margin.
 const hulls = new WeakMap<Layout, Pt[]>()
 function hullOf(L: Layout): Pt[] {
   const known = hulls.get(L)
@@ -323,9 +306,8 @@ function overHouse(L: Layout, p: Pt): boolean {
   })
 }
 
-// Leaves coming loose from the crowns and drifting down on the wind: drawn
-// under the house where they fall behind it, and over everything elsewhere;
-// one from a tree in front that would cross the house tries another path.
+// Falling leaves: under the house where they fall behind it, else over all; a front tree's leaf that
+// would cross the house tries again.
 export function weather(cv: Canvas, L: Layout): { behind: string; front: string } {
   const r = rng(11)
   const out = { behind: '', front: '' }
@@ -347,8 +329,7 @@ export function weather(cv: Canvas, L: Layout): { behind: string; front: string 
   return out
 }
 
-// A leaf's way down from somewhere in the crown of a tree standing at `foot`,
-// falling up to twice `fall` and drifting up to 8 + `drift` as it goes.
+// A leaf's path from the crown of a tree at `foot`, falling up to twice `fall`, drifting up to 8 + `drift`.
 function leafPath(r: () => number, foot: Pt, b: (typeof BUILD)[Kind], fall: number, drift: number): Pt[] {
   const sx = Math.round(foot.x - b.rx * 0.6 + r() * b.rx * 1.2)
   const sy = Math.round(foot.y - b.trunk - b.ry * 1.5 + r() * b.ry)
@@ -370,15 +351,9 @@ function fallingLeaf(cv: Canvas, leaf: Mat, path: Pt[], r: () => number): string
 
 // ---------- the garden round the house ----------
 
-// What grows on the lawn past the house's own trees, laid out once per
-// layout from a fixed seed: copses of a kind or two of tree with a bush or
-// two at their edges, a tree on its own here and there, open lawn between
-// them with a pond or two and smaller ones, reeds, flower beds, stones and
-// toadstools. Nothing stands on the house, its trees, the road or the yard,
-// and no crown reaches over them, so the house's picture over the garden's
-// never cuts one wrongly.
-// `own`: the house's trees where they stand; `order`: the grove's trees back
-// to front; `leafy`: those that drop leaves.
+// What grows past the house's trees, from a fixed seed, once per layout. Nothing stands on or reaches over
+// the house, its trees, the road or the yard, so the house's picture over it never cuts one wrongly.
+// `own`: the house's trees; `order`: back to front; `leafy`: those that drop leaves.
 type Standing = { kind: Kind; at: Pt }
 type Grove = {
   trees: Standing[]; ponds: Pond[]; beds: { at: Pt; n: number }[]; stones: Pt[]; clumps: Pt[]; toadstools: Pt[]
@@ -399,7 +374,7 @@ function groveOf(L: Layout): Grove {
   const own = TREES.map(t => ({ kind: t.kind, at: place(L, t) }))
   const lit = lampsAt(L)
   const wet0 = pondAt(L)
-  // whether anything of the house, its trees or the yard is within `m` of p
+  // whether the house, its trees or the yard come within `m` of p
   const blocked = (p: Pt, m: number) =>
     outside(hull, p) < m || outside(yard.road, p) < m + 4 || yard.pallets.some(q => outside(q, p) < m + 4) ||
     Math.hypot(p.x - yard.mailbox.x, p.y - yard.mailbox.y) < m + 8 || Math.hypot(p.x - sign.x - 6, p.y - sign.y - 3) < m + 10 ||
@@ -415,7 +390,7 @@ function groveOf(L: Layout): Grove {
   const grove: Grove = { trees: [], ponds: [], beds: [], stones: [], clumps: [], toadstools: [], own, order: [], leafy: [] }
   const near = (at: Pt, list: Pt[], d: number) => list.some(q => Math.hypot(q.x - at.x, (q.y - at.y) * 1.5) < d)
   const spaced = (at: Pt, d: number) => !near(at, grove.trees.map(t => t.at), d)
-  // candidate spots on a jittered grid, taken in a shuffled order
+  // candidate spots on a jittered grid, shuffled
   const spots = (step: number) => {
     const out: Pt[] = []
     for (let y = 42; y <= L.h - 4; y += step) for (let x = 6; x <= L.w - 6; x += step) out.push({ x: Math.round(x + (r() - 0.5) * step), y: Math.round(y + (r() - 0.5) * step) })
@@ -432,7 +407,7 @@ function groveOf(L: Layout): Grove {
     return out
   }
   const pick = <T,>(list: T[]) => list[Math.floor(r() * list.length)] as T
-  // the copses, each of a kind or two, a bush or two at its edge
+  // copses of a kind or two, a bush or two at the edge
   const MIXES: Kind[][] = [['oak', 'maple'], ['birch'], ['pine'], ['maple', 'birch'], ['pine', 'oak'], ['oak', 'maple', 'birch'], ['pine', 'birch']]
   for (const p of scatter(23, Math.round(L.h / 46), 52, p => !blocked(p, 12))) {
     const mix = pick(MIXES)
@@ -446,12 +421,12 @@ function groveOf(L: Layout): Grove {
       if (spaced(at, 13) && clear('bush', at)) (grove.trees.push({ kind: 'bush', at }), n--)
     }
   }
-  // a tree or a bush on its own here and there
+  // a lone tree or bush here and there
   for (const at of scatter(29, Math.round(L.h / 32), 28, p => spaced(p, 28))) {
     const kind = pick<Kind>(['oak', 'maple', 'birch', 'pine', 'bush', 'bush'])
     if (clear(kind, at)) grove.trees.push({ kind, at })
   }
-  // ponds where it is clearest of every tree: a big one or two, smaller ones
+  // ponds where clearest of trees: a big one or two, then smaller ones
   const wet = (p: Pt) => Math.min(99, ...grove.trees.map(t => Math.hypot((t.at.x - p.x) / 1.7, t.at.y - p.y)))
   const pondSpots = spots(13).filter(p => p.x > 20 && p.x < L.w - 20 && !blocked(p, 14)).map(p => ({ p, w: wet(p) })).sort((a, b) => b.w - a.w)
   const apart = (p: Pt, d: number) => grove.ponds.every(q => Math.hypot(q.at.x - p.x, (q.at.y - p.y) * 1.5) > d + q.rx)
@@ -465,7 +440,7 @@ function groveOf(L: Layout): Grove {
   // reeds at the ponds' edges, longer grass about the lawn
   for (const q of grove.ponds) grove.clumps.push({ x: q.at.x + (r() < 0.5 ? -1 : 1) * Math.round(q.rx * 0.8), y: Math.round(q.at.y + q.ry * 0.5) })
   grove.clumps.push(...scatter(17, Math.round(L.h / 30), 22, p => dry(p, 2) && spaced(p, 10)))
-  // flower beds, stones in ones and twos, toadstools at a few trees' feet
+  // flower beds, stones, toadstools at a few trees' feet
   grove.beds.push(...scatter(19, Math.round(L.h / 34), 28, p => dry(p, 6) && spaced(p, 16)).map(at => ({ at, n: Math.floor(r() * 3) })))
   for (const p of scatter(31, Math.round(L.h / 70), 40, p => dry(p, 3) && spaced(p, 10))) {
     grove.stones.push(p)
@@ -481,12 +456,8 @@ function groveOf(L: Layout): Grove {
   return grove
 }
 
-// The garden under the house: the lawn over the whole picture, a shade
-// lighter here and darker there, strewn with tufts, leaves and flowers; then
-// the ponds, beds, stones and grass round the house; then the grove's trees
-// back to front (the house's own are in its picture). Gives back what drifts over all of it: leaves coming loose, and
-// by night a few fireflies. `band`: only what shows between those rows, the
-// rest as it would be had it all been drawn.
+// The garden under the house; returns what drifts over it (leaves, fireflies). The house's own trees are
+// in its picture. `band`: only what shows in those rows, as drawn in the whole.
 export function garden(cv: Canvas, L: Layout, band = { y0: 0, y1: L.h }): string {
   const c = corners(L)
   const grove = groveOf(L)
@@ -514,7 +485,7 @@ export function garden(cv: Canvas, L: Layout, band = { y0: 0, y1: L.h }): string
     blob(cv, { x: s.x + 0.5, y: s.y + 0.5 }, 2.6, 1.6, G.stone)
     cv.rect(s.x - 1, s.y - 1, 2, 1, G.stoneLit)
   }
-  // leaves fallen thickest under the trees, the house's and the groves'
+  // fallen leaves under every tree
   const litter = rng(9)
   for (const t of [...grove.own, ...grove.trees]) {
     const b = BUILD[t.kind]
@@ -538,7 +509,7 @@ export function garden(cv: Canvas, L: Layout, band = { y0: 0, y1: L.h }): string
     })
   }
   const crownOf = (kind: Kind) => BUILD[kind].trunk + 2 * BUILD[kind].ry
-  for (const t of grove.order) if (shows(t.at.y, crownOf(t.kind))) treeAt(cv, t.kind, t.at)
+  for (const t of grove.order) if (shows(t.at.y, crownOf(t.kind))) treeAt(cv, t.kind, t.at, 'vh-g')
   let over = ''
   const { leafy } = grove
   const falling = Math.min(10, leafy.length)

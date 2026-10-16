@@ -1,8 +1,4 @@
-/*
- * The house's hover cards on the desktop, in its own pixel font and at its
- * scale: one picture each, drawn once and kept, since the same ones come
- * back redraw after redraw.
- */
+/* Hover cards for the desktop, in the house's pixel font and scale. */
 import { fitText, glyphText, wrapText } from './font'
 
 const PX = 0.5
@@ -11,35 +7,32 @@ const LINE = 6
 const BRIGHT = '#e8e8f0'
 const DIM = '#8c96a0'
 
-// A card follows the app's light or dark appearance by itself: its colours
-// are the dark theme's, and this style swaps in the light theme's when shown
-// in light mode. Neutral text takes the light theme's greys; anything coloured
-// is darkened to keep its contrast.
+// Dark theme colours; light mode gives neutral text the light theme's greys and darkens colour for contrast.
 const LIGHT_CARD = '@media (prefers-color-scheme: light){' +
   '.vh-p1{fill:#1f2328}.vh-p2{fill:#57606a}' +
   '.vh-ink{filter:brightness(.6) saturate(1.35)}.vh-cbg{fill:#ffffff}' +
   '}'
 const NEUTRAL: Record<string, string> = { [BRIGHT]: 'vh-p1', [DIM]: 'vh-p2' }
 
-// Pixel text whose colour follows the theme, each glyph drawn into `glyphs`
-// once.
+// Pixel text that follows the theme, each glyph defined once in `glyphs`.
 function say(text: string, x: number, y: number, color: string, glyphs: Map<string, string>): string {
   return glyphText(text, x, y, { color, cls: NEUTRAL[color] ?? 'vh-ink' }, (id, d) => glyphs.set(id, `<path id="${id}" d="${d}"/>`))
 }
 
-// A hover card in the house's pixel style, `w` units wide (sized by the caller
-// so its pixels match the house's): a frame with notched corners in `color`,
-// the first line as its title in that colour, the rest below it.
-// Long lines wrap to two. Cards are kept, since the same ones are drawn
-// redraw after redraw.
+// A card `w` units wide, sized by the caller to the house's pixels. Kept, as cards repeat each redraw,
+// the least recently drawn dropped first: a live agent's card, new each second, leaves the rest be.
 const cards = new Map<string, string>()
 
 export function cardSvg(lines: string[], color: string, w: number): string {
   const key = JSON.stringify([lines, color, w])
   const known = cards.get(key)
-  if (known !== undefined) return known
+  if (known !== undefined) {
+    cards.delete(key)
+    cards.set(key, known)
+    return known
+  }
   const made = drawCard(lines, color, w)
-  if (cards.size > 300) cards.clear()
+  if (cards.size >= 300) cards.delete(cards.keys().next().value as string)
   cards.set(key, made)
   return made
 }

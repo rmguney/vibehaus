@@ -1,13 +1,6 @@
 /*
- * The house: six rooms on one floor, seen from above at an angle, the walls
- * nearest you cut down so every room shows. The plan is laid out in floor
- * units (x to the lower right of the picture, y to the lower left); `at`
- * projects a point of it, at a height, onto the picture.
- *
- * Back row, left to right: library, study and sunroom; front row: kitchen,
- * workshop and the bedroom lounge. The two outer walls at the back stand
- * full height, papered, with windows; the walls between rooms are low, with
- * a doorway in each, and a front door opens on the yard from the workshop.
+ * The house: six rooms seen from above at an angle, near walls cut down. Plan x runs to the picture's
+ * lower right, y to its lower left. Back row: library, study, sunroom; front: kitchen, workshop, lounge.
  */
 import type { Room } from '../types'
 import { Canvas, faces, mat, warm, warmFaces } from './iso'
@@ -15,22 +8,19 @@ import type { Faces, Mat, Pt } from './iso'
 
 export type Dir = 'N' | 'S' | 'E' | 'W'
 export type Cell = { x: number; y: number; w: number; h: number; col: number; row: number }
-// `w` and `h`: the picture's size; `pw` and `ph`: the plan's; `ox`, `oy`:
-// where the plan's corner lands in the picture.
-// `extra`: in a tall picture, how much more garden lies above the house's
-// own stretch of it and below, in picture units each way.
+// `w`, `h`: picture size; `pw`, `ph`: plan size; `ox`, `oy`: where the plan's corner lands.
+// `extra`: in a tall picture, the garden added above and below the house, in picture units each way.
 export type Layout = { w: number; h: number; pw: number; ph: number; ox: number; oy: number; grid: Room[][]; rooms: Record<Room, Cell>; extra?: number }
 
-// A room's floor is S units each way; walls are T thick.
+// Room floors are S units square; walls are T thick.
 const S = 40
 export const T = 2
 export const TALL_WALL = 26
 const LOW_WALL = 5
 const PAD = 3
-// room above the back walls for the labels on them
+// for the back walls' labels
 const HEADROOM = 4
-// room around the house in its own stretch of the picture: either side,
-// above for the trees behind it, and below for the yard's far end
+// margins: the sides, the trees behind, the yard's far end below
 const SIDE = 14
 const TREES = 10
 const BELOW = 14
@@ -50,32 +40,29 @@ export function house(): Layout {
   return { w: pw + ph + 2 * (PAD + SIDE), h: Math.ceil((pw + ph) / 2 + oy + PAD + BELOW), pw, ph, ox, oy, grid: HOUSE, rooms }
 }
 
-// The same house in a picture `by` units taller each way, the garden going
-// on above and below it.
+// The house in a picture `by` units taller each way, more garden above and below.
 export function stretch(L: Layout, by: number): Layout {
   return { ...L, oy: L.oy + by, h: L.h + 2 * by, extra: by }
 }
 
-// A point of the plan at height z, on the picture.
+// A plan point at height z, on the picture.
 export function at(L: Layout, x: number, y: number, z = 0): Pt {
   return { x: x - y + L.ox, y: (x + y) / 2 - z + L.oy }
 }
 
-// Doorways: each wall between two rooms has one, ten units wide, near the
-// front end of the wall, clear of the furniture along the back.
+// Doorways near each inner wall's front end, clear of the furniture at the back.
 const DOOR = 32
 export const doorY = (c: Cell) => c.y + DOOR
 export const doorX = (c: Cell) => c.x + DOOR
 export const floorBottom = (c: Cell) => c.y + c.h - 3
 
-// The front door, in the workshop's front wall, where the road out to the
-// street starts: its span along the wall, and its middle.
+// The front door, where the road starts.
 export function frontDoor(L: Layout): { x0: number; x1: number; mid: number } {
   const mid = L.rooms.workshop.x + 21
   return { x0: mid - 5, x1: mid + 5, mid }
 }
 
-// Where idle agents may stand about in a room, clear of its furniture.
+// Where idle agents may stand in a room, clear of its furniture.
 export function freeFloor(room: Room, c: Cell): { x0: number; x1: number; y0: number; y1: number } {
   if (room === 'lounge') return { x0: c.x + 17, x1: c.x + c.w - 4, y0: c.y + 23, y1: c.y + c.h - 3 }
   return { x0: c.x + 11, x1: c.x + c.w - 5, y0: c.y + 15, y1: c.y + c.h - 3 }
@@ -94,8 +81,7 @@ const MAT = {
   frame: warm('kf', '#fbf8f1'),
 }
 
-// Each room's wallpaper (with its stripe) and floor (with its seams or
-// second tile), and the colour its name is written in.
+// Each room's wallpaper, floor, and `ink` for its name.
 export const ROOM_STYLE: Record<Room, { paper: Mat; stripe: Mat; floor: Mat; seam: Mat; kind: 'planks' | 'tiles' | 'carpet'; ink: string }> = {
   library: { paper: warm('pl', '#7aa587'), stripe: warm('ql', '#8bb697'), floor: warm('fl', '#a26f47'), seam: warm('gl', '#86593a'), kind: 'planks', ink: '#9fe0b4' },
   study: { paper: warm('pb', '#7b98c8'), stripe: warm('qb', '#8aa6d3'), floor: warm('fb', '#b3814f'), seam: warm('gb', '#946840'), kind: 'planks', ink: '#9cc4ff' },
@@ -107,9 +93,7 @@ export const ROOM_STYLE: Record<Room, { paper: Mat; stripe: Mat; floor: Mat; sea
 
 // ---------- patterns ----------
 
-// Floor and wallpaper patterns on the picture's own grid: planks with seams
-// running along the floor, tiles in a checker, carpet with a soft weave, and
-// paper with thin upright stripes.
+// Floor and wallpaper patterns, on the pixel grid.
 export function patterns(cv: Canvas): string {
   const parts: string[] = []
   const use = (m: Mat) => {
@@ -119,7 +103,7 @@ export function patterns(cv: Canvas): string {
   for (const room of ALL_ROOMS) {
     const s = ROOM_STYLE[room]
     if (s.kind === 'planks') {
-      // a seam every four units across the planks, a joint now and then
+      // a seam every four units, a joint now and then
       let seam = ''
       for (let i = 0; i < 8; i++) seam += `<rect x="${i}" y="${Math.floor(i / 2)}" width="1" height="1"/>`
       parts.push(`<pattern id="f-${room}" width="8" height="4" patternUnits="userSpaceOnUse"><rect width="8" height="4" ${use(s.floor)}/><g ${use(s.seam)}>${seam}</g></pattern>`)
@@ -137,16 +121,14 @@ export function patterns(cv: Canvas): string {
   return parts.join('')
 }
 
-// A box drawn once for its size and material, and copied for every other of
-// the same: stretches of wall, mostly.
+// A box stamped once per size and material: stretches of wall, mostly.
 function boxStamp(cv: Canvas, L: Layout, tag: string, x: number, y: number, w: number, d: number, h: number, f: Faces, z = 0): void {
   cv.stamp(`${tag}${w}x${d}x${h}`, at(L, x, y, z), sub => box(sub, L, x, y, w, d, h, f, z))
 }
 
 // ---------- boxes and faces ----------
 
-// A box standing on the plan: `x`, `y` its back corner, `w` along x, `d`
-// along y, `h` tall from height `z`. Only the three faces you can see.
+// A box: back corner `x`, `y`, `h` tall from `z`; only the visible faces.
 export function box(cv: Canvas, L: Layout, x: number, y: number, w: number, d: number, h: number, f: Faces, z = 0): void {
   const z1 = z + h
   cv.poly([at(L, x, y, z1), at(L, x + w, y, z1), at(L, x + w, y + d, z1), at(L, x, y + d, z1)], f.top)
@@ -154,13 +136,12 @@ export function box(cv: Canvas, L: Layout, x: number, y: number, w: number, d: n
   cv.poly([at(L, x + w, y, z1), at(L, x + w, y + d, z1), at(L, x + w, y + d, z), at(L, x + w, y, z)], f.right)
 }
 
-// A patch on the face of a wall or box that looks along y (it runs along
-// x): from x0 to x1, heights z0 to z1, at depth y.
+// A patch on a face looking along y, at depth y: x0 to x1, heights z0 to z1.
 export function faceY(cv: Canvas, L: Layout, y: number, x0: number, x1: number, z0: number, z1: number, m: Mat | string): void {
   cv.poly([at(L, x0, y, z1), at(L, x1, y, z1), at(L, x1, y, z0), at(L, x0, y, z0)], m)
 }
 
-// The same on a face that looks along x (it runs along y).
+// The same, looking along x.
 export function faceX(cv: Canvas, L: Layout, x: number, y0: number, y1: number, z0: number, z1: number, m: Mat | string): void {
   cv.poly([at(L, x, y0, z1), at(L, x, y1, z1), at(L, x, y1, z0), at(L, x, y0, z0)], m)
 }
@@ -168,15 +149,13 @@ export function faceX(cv: Canvas, L: Layout, x: number, y0: number, y1: number, 
 // ---------- the shell: base, floors, walls ----------
 
 export function shell(cv: Canvas, L: Layout): void {
-  // the house stands on a low base: only its two front sides show
+  // the low base: only its front sides show
   faceY(cv, L, L.ph, 0, L.pw, -3, 0, MAT.slab.left)
   faceX(cv, L, L.pw, 0, L.ph, -3, 0, MAT.slab.right)
   cv.layer()
   for (const room of ALL_ROOMS) floor(cv, L, L.rooms[room], `url(#f-${room})`)
   cv.layer()
-  // the two outer walls at the back, full height, papered room by room: of
-  // the bare wall, only the tops, the ends, a band along the top and the
-  // pillars between rooms show
+  // the tall back walls, papered per room: bare only at tops, ends, a top band and pillars
   const top = (pts: Pt[]) => cv.poly(pts, MAT.trim.top)
   top([at(L, 0, 0, TALL_WALL), at(L, T, T, TALL_WALL), at(L, T, L.ph, TALL_WALL), at(L, 0, L.ph, TALL_WALL)])
   top([at(L, 0, 0, TALL_WALL), at(L, L.pw, 0, TALL_WALL), at(L, L.pw, T, TALL_WALL), at(L, T, T, TALL_WALL)])
@@ -184,7 +163,7 @@ export function shell(cv: Canvas, L: Layout): void {
   faceX(cv, L, L.pw, 0, T, 0, TALL_WALL, MAT.trim.right)
   faceX(cv, L, T, T, L.ph, TALL_WALL - 1, TALL_WALL, MAT.trim.right)
   faceY(cv, L, T, T, L.pw, TALL_WALL - 1, TALL_WALL, MAT.trim.left)
-  // the inside of each wall's front end, past the last room's paper
+  // each wall's inner front end, past the last room's paper
   faceX(cv, L, T, L.ph - T, L.ph, 0, TALL_WALL - 1, MAT.trim.right)
   faceY(cv, L, T, L.pw - T, L.pw, 0, TALL_WALL - 1, MAT.trim.left)
   for (const room of ALL_ROOMS) {
@@ -197,7 +176,7 @@ export function shell(cv: Canvas, L: Layout): void {
   cv.layer()
   for (const room of ALL_ROOMS) {
     const c = L.rooms[room]
-    // a skirting board along the foot of the papered walls
+    // skirting boards
     if (c.col === 0) faceX(cv, L, T, c.y, c.y + c.h, 0, 2, MAT.trim.right)
     if (c.row === 0) faceY(cv, L, T, c.x, c.x + c.w, 0, 2, MAT.trim.left)
   }
@@ -217,16 +196,14 @@ export function shell(cv: Canvas, L: Layout): void {
   cv.layer()
 }
 
-// A room's floor, filled: with its own pattern, or a lamp's light over it.
+// A room's floor, filled with its pattern or a lamp's light.
 export function floor(cv: Canvas, L: Layout, c: Cell, fill: string, attrs = '', inner = ''): void {
   cv.stamp('fl', at(L, c.x, c.y), sub => sub.poly([at(L, c.x, c.y), at(L, c.x + c.w, c.y), at(L, c.x + c.w, c.y + c.h), at(L, c.x, c.y + c.h)], 'inherit'), fill, attrs, inner)
 }
 
-// The cut-down walls along the front edges, drawn last of the house so they
-// sit in front of the floors.
+// The cut-down front walls, drawn last to sit in front of the floors.
 export function frontWalls(cv: Canvas, L: Layout): void {
-  // in room-long stretches, each drawn once and copied along; the front
-  // door's stretch in two pieces either side of a doorstep
+  // stamped room-long stretches; the front door's split around a doorstep
   const d = frontDoor(L)
   for (let x = 0; x < L.pw; x += S + T) {
     const w = Math.min(S + T, L.pw - x)
@@ -240,8 +217,7 @@ export function frontWalls(cv: Canvas, L: Layout): void {
   cv.layer()
 }
 
-// A window on a back wall: a frame, the sky in it (stars and a moon by night,
-// a cloud by day) and a cross of glazing bars. `along` says which wall.
+// A back-wall window: frame, sky (stars and moon by night, cloud by day), bars. `along`: which wall.
 export function windowOn(cv: Canvas, L: Layout, along: 'x' | 'y', a0: number, a1: number, z0: number, z1: number, seed: number): void {
   const origin = along === 'x' ? at(L, a0, T, z1) : at(L, T, a0, z1)
   cv.stamp(`win-${along}${a1 - a0}x${z1 - z0}s${seed}`, origin, sub => windowDrawn(sub, L, along, a0, a1, z0, z1, seed))
@@ -256,7 +232,7 @@ function windowDrawn(cv: Canvas, L: Layout, along: 'x' | 'y', a0: number, a1: nu
   cv.layer()
   const mid = Math.round((a0 + a1) / 2)
   const span = a1 - a0 - 2
-  // a few stars, the same each time for the same window
+  // a few stars, fixed by the seed
   for (let i = 0; i < 4; i++) {
     const u = a0 + 1.5 + ((seed * 7 + i * 5) % Math.max(1, span - 1))
     const v = z0 + 2 + ((seed + i * 3) % Math.max(1, z1 - z0 - 4))

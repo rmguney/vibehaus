@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # the version last tested; function hooks are early access, so a newer release may change them
+      - run: npm install -g @anthropic-ai/claude-code@2.1.299
+      - run: claude plugin validate --strict .
+      - run: claude plugin validate --strict vibehaus
+      - run: node tests/run.mjs
+      # no type check: it needs types Claude Code writes when it loads the plugin, which are not in git

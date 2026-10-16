@@ -1,20 +1,14 @@
 /*
- * Isometric pixel drawing for the house: a 2:1 projection of the floor plan,
- * and a canvas that fills shapes on the picture's pixel grid, so walls,
- * floors and furniture have the stair-stepped edges of pixel art.
- *
- * Every fill is a material: its colours at night (the dark theme) and by day
- * (the light theme). The picture carries the night colours and a style that
- * swaps in the day ones when the app is in light mode.
+ * Isometric pixel drawing: a 2:1 projection and a canvas that fills shapes on the pixel grid. Each fill
+ * is a material with night (dark theme) and day colours; a style swaps in the day ones in light mode.
  */
 
 export type Pt = { x: number; y: number }
 
-// A material: night and day colours, and a short class name for the style.
+// A material: night and day colours, and a short class for the style.
 export type Mat = { night: string; day: string; cls: string }
 
-// The three faces of a box: lit top, the side toward the left of the screen,
-// the side toward the right, darkest.
+// A box's faces: lit top, left side, darkest right side.
 export type Faces = { top: Mat; left: Mat; right: Mat }
 
 export function shade(hex: string, f: number): string {
@@ -26,8 +20,7 @@ export function shade(hex: string, f: number): string {
   return '#' + ((c(16) << 16) | (c(8) << 8) | c(0)).toString(16).padStart(6, '0')
 }
 
-// mulberry32: a small seeded generator, so a picture is the same on every
-// redraw.
+// mulberry32: a small seeded generator, so a picture is the same on every redraw.
 export function rng(seed: number): () => number {
   let a = seed >>> 0
   return () => {
@@ -39,13 +32,11 @@ export function rng(seed: number): () => number {
   }
 }
 
-// A material from its night and day colours; `faces` adds the box shades.
 export function mat(cls: string, night: string, day: string): Mat {
   return { cls, night, day }
 }
 
-// Indoors by night: the day colour under warm lamplight, a little dimmer and
-// shifted towards amber, so the house glows against the dark garden.
+// Indoors by night: the day colour dimmed towards amber, so the house glows in the dark garden.
 function lamplit(day: string): string {
   const v = parseInt(day.slice(1), 16)
   const ch = (s: number, f: number) => Math.min(255, Math.round(((v >> s) & 255) * f))
@@ -68,9 +59,7 @@ export function faces(cls: string, night: string, day: string): Faces {
   }
 }
 
-// The pixel rows of a convex polygon: each row's run of pixels whose centres
-// fall inside, left edges in and right edges out, so shapes sharing an edge
-// tile without gaps or overlaps.
+// A convex polygon's pixel rows (centres inside; left edge in, right out), so shared edges tile exactly.
 function rows(pts: Pt[]): [number, number, number][] {
   if (pts.length < 3) return []
   const ys = pts.map(p => p.y)
@@ -98,20 +87,17 @@ function rows(pts: Pt[]): [number, number, number][] {
   return out
 }
 
-// Paths for one picture, layer by layer: within a layer every fill of one
-// material is one path; layers stack in the order they were opened.
+// One picture's paths: one per material in each layer; layers stack in the order opened.
 export class Canvas {
   private parts: string[] = []
   private open = new Map<string, { m: Mat | string; d: string[] }>()
   readonly used = new Map<string, Mat>()
-  // pieces drawn once and placed again by reference: where each was drawn
+  // stamped pieces: where each was first drawn
   private stamps = new Map<string, Pt>()
   private defs: string[] = []
 
-  // Draws a piece that recurs (a desk, a plant, a stretch of wall) once, and
-  // every later one as a copy moved over by whole pixels. `origin` is any
-  // point of the piece, the same point on every copy; `fill` fills a piece
-  // drawn with the `inherit` material, as a floor or wallpaper.
+  // Draws a recurring piece once, then copies moved by whole pixels. `origin`: the same point on each;
+  // `fill` fills pieces drawn with `inherit` (floors, wallpaper).
   stamp(name: string, origin: Pt, draw: (cv: Canvas) => void, fill?: string, attrs = '', inner = ''): void {
     // pieces at different half-pixel phases rasterise differently: one stamp each
     const id = `${name}${phaseOf(origin)}`
@@ -132,9 +118,7 @@ export class Canvas {
     this.raw(`<use href="#${id}" x="${dx}" y="${dy}"${paint}${end}`)
   }
 
-  // Defines a piece once without placing it, for copies placed by hand, as
-  // a tree whose crown sways about its own trunk. `draw` may hand back an
-  // animation for the whole piece, as a sway.
+  // Defines a piece without placing it, for hand-placed copies; `draw` may return an animation.
   define(id: string, draw: (cv: Canvas) => string | void): void {
     if (this.stamps.has(id)) return
     const sub = new Canvas()
@@ -149,7 +133,7 @@ export class Canvas {
     return this.defs.join('')
   }
 
-  // Starts a new layer: anything drawn after it lies over everything before.
+  // Starts a new layer over everything drawn before.
   layer(): void {
     for (const { m, d } of this.open.values()) {
       if (d.length === 0) continue
@@ -198,25 +182,25 @@ export class Canvas {
   }
 }
 
-// A point's place within its pixel, for telling stamps apart by it.
+// A point's half-pixel phase, to tell stamps apart.
 function phaseOf(p: Pt): string {
   const part = (v: number) => Math.round((((v % 1) + 1) % 1) * 2) % 2
   return part(p.x) || part(p.y) ? `-h${part(p.x)}${part(p.y)}` : ''
 }
 
-// The outline of a stack of pixel rows, one under the next: down the right
-// side, back up the left, in small relative steps.
+// The outline of consecutive pixel rows: down the right side, back up the left.
 function outline(list: [number, number, number][]): string {
   const first = list[0] as [number, number, number]
   let d = `M${first[1]} ${first[0]}`
   let x = first[1]
   let down = 0
   const across = (to: number) => {
+    if (to === x) return
     if (down !== 0) {
       d += `v${down}`
       down = 0
     }
-    if (to !== x) d += `h${to - x}`
+    d += `h${to - x}`
     x = to
   }
   for (const [, left, w] of list) {
@@ -230,25 +214,21 @@ function outline(list: [number, number, number][]): string {
   return `${d}${down !== 0 ? `v${down}` : ''}z`
 }
 
-// The colours of every material a picture used, by night or by day.
+// CSS for every material a picture used, by night or day.
 export function styleOf(used: Iterable<Mat>, time: 'night' | 'day'): string {
   let css = ''
   for (const m of used) css += `.${m.cls}{fill:${m[time]}}`
   return css
 }
 
-// The path of a convex polygon's pixels, for a shape that animates on its
-// own (a flame, a screen) rather than joining a material's path.
+// A convex polygon's pixels as their own path, for shapes that animate alone.
 export function pathOf(pts: Pt[]): string {
   return rows(pts).map(([r, x, w]) => `M${x} ${r}h${w}v1h-${w}z`).join('')
 }
 
 // ---------- the clock ----------
 
-// When the picture is drawn, in seconds. Anything that loops by itself (a
-// crown swaying, a leaf falling, an eye blinking) starts where the clock has
-// it in its loop, so a picture drawn afresh carries on exactly where the last
-// one was, and a redraw never shows.
+// Draw time (s): loops (a sway, a blink) start where this clock puts them, so redraws never show.
 let clockS = 0
 
 export function setClock(now: number): void {
