@@ -673,6 +673,7 @@ const TOGGLE = '◧ Vibehaus'
 const BAR_MIN = 3
 const BAR_ROOMY = 4
 const BAR_MAX = 40
+const DESKTOP_PAD = 4
 const percentText = (m: Meter) => (m.percent === undefined ? '--' : `${Math.round(m.percent)}%`)
 
 function bandOf(meters: Meter[], columns: number | undefined, now: number): { bar: number; words: string[] } {
@@ -1456,17 +1457,19 @@ export const register: Register = on => {
     await read($, minute)
     const now = await $.clock.now()
     const meters = metersOf(current(await read($, plan), now))
-    const { bar, words } = bandOf(meters, e.props.bodyColumns, now)
+    // the desktop's band pads its row inside the columns it reports
+    const cols = Number.isFinite(e.props.bodyColumns) ? e.props.bodyColumns - (e.surface === 'desktop' ? DESKTOP_PAD : 0) : undefined
+    const { bar, words } = bandOf(meters, cols, now)
 
-    // monospaced, as the meters' cells were counted in it
+    // monospaced, as the meters' cells were counted in it; one row always, the meters cut short before it wraps
     return (
-      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
-        <Box flexDirection="row" alignItems="center" columnGap={2} flexShrink={1}>
+      <Box flexDirection="row" flexWrap="nowrap" justifyContent="space-between" alignItems="center" columnGap={2}>
+        <Box flexDirection="row" flexWrap="nowrap" alignItems="center" columnGap={2} flexShrink={1} overflow="hidden">
           {meters.map((m, i) => {
             const filled = m.percent === undefined ? 0 : Math.round((Math.max(0, Math.min(100, m.percent)) / 100) * bar)
             const color = m.percent === undefined ? undefined : meterColor(m)
             return (
-              <Text mono>
+              <Text mono wrap="truncate-end">
                 <Text dimColor>{`${m.label} `}</Text>
                 <Text color={color}>{'━'.repeat(filled)}</Text>
                 <Text color="#3a3f47">{'━'.repeat(bar - filled)}</Text>
@@ -1475,7 +1478,9 @@ export const register: Register = on => {
             )
           })}
         </Box>
-        <Button key="vibehaus-toggle" label={TOGGLE} plain dimColor onPress={() => void togglePane($)} />
+        <Box flexShrink={0}>
+          <Button key="vibehaus-toggle" label={TOGGLE} plain dimColor onPress={() => void togglePane($)} />
+        </Box>
       </Box>
     )
   }).catch((_, e, next) => next(e))

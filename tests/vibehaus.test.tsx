@@ -368,8 +368,10 @@ test('the plan bars show the five hour and weekly windows as Claude Code measure
     const wide = await bandOn($, surface, 120)
     expect(wide.meters[0]).toMatch(/^5H ━+ 12% · Resets 2h 10m$/)
     expect(wide.meters[1]).toMatch(new RegExp(`^Week ━+ 93% · Resets ${weekday}$`))
-    expect(wide.width).toBeLessThanOrEqual(120)
-    expect(wide.width).toBeGreaterThanOrEqual(117)
+    // the desktop's row a few cells short, for its padding
+    const room = surface === 'desktop' ? 116 : 120
+    expect(wide.width).toBeLessThanOrEqual(room)
+    expect(wide.width).toBeGreaterThanOrEqual(room - 3)
   }
   // narrower, reset times shorten then go, the bars still filling the row
   const narrow = await bandOn($, 'terminal', 56)
