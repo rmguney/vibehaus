@@ -1277,14 +1277,11 @@ function cardOf(ui: Pick<Elements['terminal'], 'Box' | 'Text'>, lines: string[],
   )
 }
 
-// With `afresh` (the person's own asks) an open pane is reopened, as on the desktop one reopened while
+// Opened only when the person asks; one already open is reopened, as on the desktop one reopened while
 // open, or kept across a plugin reload, can stay blank.
-async function openPane($: EngineInterface, afresh = false): Promise<void> {
+async function openPane($: EngineInterface): Promise<void> {
   const panes = await $.ui.panes().catch(() => [])
-  if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
-    if (!afresh) return
-    await $.ui.close({ id: PANE }).catch(() => undefined)
-  }
+  if (panes.some(pane => pane.id === PANE && pane.isPlaced)) await $.ui.close({ id: PANE }).catch(() => undefined)
   await $.ui.open({ id: PANE, title: 'Vibehaus' })
 }
 
@@ -1399,17 +1396,16 @@ async function togglePane($: EngineInterface): Promise<void> {
   try {
     const isShowing = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)
     if (isShowing) await $.ui.close({ id: PANE })
-    else await openPane($, true)
+    else await openPane($)
   } catch {
     // a surface that cannot list panes still gets the house opened
-    await openPane($, true).catch(() => undefined)
+    await openPane($).catch(() => undefined)
   }
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await begin($)
-    void openPane($).catch(() => undefined)
     ticker?.cancel()
     ticker = $.clock.every(MINUTE, () => void tickPlan($).catch(() => undefined))
 
@@ -1436,7 +1432,7 @@ export const register: Register = on => {
         return { text: 'The demo household moved out.' }
       }
       await startDemo($)
-      await openPane($, true)
+      await openPane($)
       return { text: 'A demo household moved in for five minutes. Run /haus demo again to send them home.' }
     }
     if (arg === 'snapshot') {
@@ -1444,7 +1440,7 @@ export const register: Register = on => {
       return { text: 'Saved the house to vibehaus-snapshot.svg in the folder Claude Code runs in. It is an animated SVG, so open it in a browser.' }
     }
     if (arg) return { text: 'Usage: /haus, /haus demo or /haus snapshot.' }
-    await openPane($, true)
+    await openPane($)
 
     return { text: 'Vibehaus opened.' }
   })

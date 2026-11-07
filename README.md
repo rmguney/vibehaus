@@ -53,7 +53,7 @@ Where an organization manages Claude Code, its classic hooks run only for plugin
 
 ## Use
 
-- It opens when a session starts (in a terminal 144 columns wide or more, 110 once you have opened it, until you close it by hand); `/haus` opens it anywhere.
+- A session starts with only the band above the prompt; `/haus` or the band's **◧ Vibehaus** button opens the house.
 - `/haus demo` moves a made-up household in for five minutes; run it again to send them home.
 - `/haus snapshot` saves the house as `vibehaus-snapshot.svg`, an animated SVG, in the folder Claude Code runs in.
 - **◧ Vibehaus** in the band above the prompt opens or closes it; the band also shows your vibe fatigue. It gives way while Claude Code shows a survey there.

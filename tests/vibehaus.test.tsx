@@ -650,13 +650,19 @@ test('a session\'s start sets the house up, and so does a /clear, which has none
     registered.push(name)
     return { value: { command: name } }
   })
-  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  const opened: string[] = []
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true as const } }
+  })
   on('session.start', () => ({ cwd: '/work' }) as never)
   on('classic.SessionStart', () => ({}) as never)
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true } as never)
   expect(registered).toEqual(['haus'])
   await $.classic.SessionStart({ source: 'clear', session_id: 'next', transcript_path: '', cwd: '/work', hook_event_name: 'SessionStart' } as never)
   await until(() => registered.length === 2)
+  // the band alone: the house waits to be asked for
+  expect(opened).toEqual([])
 })
 
 test('a background task\'s end notice says how it ended, even after the house took it for completed', async ($, on) => {
